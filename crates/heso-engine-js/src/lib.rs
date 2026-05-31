@@ -52,42 +52,54 @@
 //!
 //! ## Determinism
 //!
-//! QuickJS itself is deterministic. The other JS sources of
-//! nondeterminism are mostly closed:
+//! QuickJS itself is deterministic. The remaining JS sources of
+//! nondeterminism are closed at the **C layer** via the hesojs
+//! determinism fork's host-injection hooks (ADR 0030) — no JS-side
+//! monkey-patches, no process-global `TZ` mutation:
 //!
 //! - `setTimeout` / `setInterval` route through [`VirtualClock`] — fired
 //!   in `(scheduled_time, sequence)` order via [`JsEngine::tick`], no
 //!   wall clock involved.
-//! - `Math.random`, `crypto.getRandomValues`, and `crypto.randomUUID`
-//!   route through [`SeededRng`] (ChaCha20). Construct the engine with
-//!   [`JsEngine::new_with_seed`] (the CLI exposes this as `--seed N` on
-//!   `heso eval-js` and `heso eval-dom`); same seed, byte-identical
-//!   output across runs and machines.
-//!
-//! - `Date.now()` and zero-arg `new Date()` route through the same
-//!   [`VirtualClock`] — `Date.now()` reads `clock.now_ms()` as an
-//!   `f64`, and `new Date()` (the zero-arg construction form, where
-//!   the spec reads the host clock) is monkey-patched to
-//!   `new Date(Date.now())`. Explicit-input forms
-//!   (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`,
-//!   `Date.parse`, `Date.UTC`) are pure functions of their inputs
-//!   and stay on the QuickJS built-in. A fresh engine starts at
-//!   virtual epoch `0` (= midnight 1970-01-01 UTC); the host advances
-//!   it via [`JsEngine::advance_clock`], the same control surface as
-//!   timers.
+//! - `Math.random` draws its bytes from [`SeededRng`] (ChaCha20) via
+//!   `JS_SetRandomSource`. `crypto.getRandomValues` / `crypto.randomUUID`
+//!   are a thin JS shim layered on the now-deterministic `Math.random`
+//!   (crypto is a web API heso owns, not an engine builtin). Construct
+//!   the engine with [`JsEngine::new_with_seed`] (`--seed N` on
+//!   `heso eval-js` / `heso eval-dom`); same seed, byte-identical output
+//!   across runs and machines.
+//! - `Date.now()`, zero-arg `new Date()`, `performance.now()`, and
+//!   `performance.timeOrigin` read the [`VirtualClock`] via
+//!   `JS_SetClockSource`; the engine's timezone is pinned to UTC via
+//!   `JS_SetRuntimeTimezone(rt, "UTC")`, so the local-time `Date`
+//!   accessors (`getHours`, `toString`, `getTimezoneOffset`, the
+//!   multi-arg constructor) all produce host-independent UTC bytes off
+//!   the engine's own builtins. Explicit-input forms (`new Date(ms)`,
+//!   `new Date(str)`, `Date.parse`, `Date.UTC`) are pure functions of
+//!   their inputs. A fresh engine starts at virtual epoch `0`
+//!   (= midnight 1970-01-01 UTC); the host advances it via
+//!   [`JsEngine::advance_clock`], the same control surface as timers.
 //!
 //! `fetch()` / `XMLHttpRequest` are not fully deterministic yet — `fetch`
 //! is installed but currently lives in `DeterministicNoCassette` mode
 //! under `--seed N` until record/replay (ADR 0008 item M) lands and the
 //! recorded-network shim makes JS-issued HTTP calls reproducible too.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: the workspace default is
+// `forbid(unsafe_code)`, but per `.agent/CONVENTIONS.md` this is the
+// sanctioned C-binding exception. The ONLY `unsafe` lives in `ffi` (the
+// hesojs determinism boundary, ADR 0030); `deny` lets that one module
+// opt in via `#![allow(unsafe_code)]` while every other module stays
+// hard-denied.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod cookies;
 pub(crate) mod custom_elements;
 pub mod dom;
 pub mod engine;
+/// The single audited `unsafe` boundary to the hesojs determinism C API
+/// (clock / RNG / timezone injection). See ADR 0030.
+pub(crate) mod ffi;
 pub mod events;
 pub mod fetch;
 pub(crate) mod form_submit;

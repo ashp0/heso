@@ -13,6 +13,17 @@ members = [
     "crates/heso-compat-tests",
     "crates/heso-compat-suite",
 ]
+# Vendored fork of rquickjs-sys 0.11.0 that compiles the hesojs determinism-
+# hardened QuickJS-NG fork instead of stock quickjs-ng (see ADR 0030). It is a
+# `[patch.crates-io]` target, not a workspace member — it keeps its own
+# upstream-shaped Cargo.toml and must not inherit workspace lints/profiles.
+exclude = ["crates/heso-quickjs-sys"]
+
+# Build the JS engine from the in-tree hesojs fork. Same package name + version
+# (rquickjs-sys 0.11.0), so rquickjs / rquickjs-core resolve to this path
+# unchanged; only the C sources + regenerated bindgen output differ.
+[patch.crates-io]
+rquickjs-sys = { path = "crates/heso-quickjs-sys" }
 
 [workspace.package]
 version = "0.2.2"

@@ -4,6 +4,39 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The JS engine is now built from the in-tree **hesojs** determinism
+  fork (a QuickJS-NG fork) instead of stock `rquickjs`'s vendored tree
+  (ADR 0030). Determinism is injected at the C layer —
+  `JS_SetClockSource` / `JS_SetRandomSource` / `JS_SetRuntimeTimezone`
+  replace the JS-side monkey-patches (the `WrappedDate` shim, the
+  `Math.random` / `performance.now` closures, and the process-global
+  `TZ=UTC` pin). `crypto` is now a pure-JS shim over the seeded engine
+  RNG rather than a Rust closure.
+
+### Removed
+
+- The `disable-assertions` (`-DNDEBUG`) workaround and the four-step
+  `Drop` GC dance. heso now ships with C **assertions ON**: the
+  ES2025 iterator-helper shutdown-GC reference cycle that aborted
+  `eval-dom` on some pages is fixed at the engine (hesojs F1), with
+  `JS_FreeRuntimeForce` as the safety net.
+
+### Fixed
+
+- `eval-dom` no longer aborts tearing down the runtime on pages that
+  exercise the iterator-helper shutdown-GC cycle (e.g. astro.build,
+  vercel.com).
+
+> **Note:** `plat_hash` shifts for pages that read the date or RNG.
+> Native `Date.toString()` and `Math.random` produce different bytes
+> than the old JS shims (determinism still holds: same seed + same
+> engine version → identical bytes). Re-stamp cassettes recorded
+> against the old engine.
+
 ## [0.2.0] - 2026-05-28
 
 ### Removed

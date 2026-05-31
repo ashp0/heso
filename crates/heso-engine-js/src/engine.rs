@@ -34,7 +34,7 @@
 //! and Arrays — class instances (DOM Elements, Response objects, Map,
 //! Set, etc.) flow through unchanged.
 
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use reqwest_cookie_store::CookieStoreMutex;
 use rquickjs::{
@@ -120,6 +120,20 @@ const DEFAULT_GC_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
 /// Linux, 1 MB on Windows by default but the rquickjs check
 /// is against the *managed* JS stack, not the OS stack).
 const DEFAULT_MAX_STACK_BYTES: usize = 1024 * 1024;
+
+/// Cap on `JSON.stringify` output, wired into the engine via hesojs's
+/// `JS_SetMaxStringifyBytes` (F9). heso caps eval output by
+/// stringifying then length-checking; without this the full (possibly
+/// 500 MB) serialization runs to completion before the cap is seen.
+/// 16 MiB is the PRD §10 value — comfortably above any real page's
+/// extracted payload, well below a DoS-grade allocation.
+const DEFAULT_MAX_STRINGIFY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Interrupt-handler poll granularity in opcodes, wired via hesojs's
+/// `JS_SetInterruptPollGranularity` (F10). Lower than the engine's
+/// 10000-opcode default so `--js-timeout` deadlines fire promptly;
+/// hesojs clamps a floor of 64. 1024 is the PRD §10 value.
+const DEFAULT_INTERRUPT_POLL_GRANULARITY: u32 = 1024;
 
 /// Severity of a captured `console.*` call.
 ///
@@ -245,13 +259,20 @@ pub struct JsEngine {
     /// `pending_timers` methods. See [`crate::timers`] for the full
     /// design.
     timers: Arc<Mutex<TimerScheduler>>,
-    /// Per-engine seeded PRNG backing `Math.random`,
-    /// `crypto.getRandomValues`, and `crypto.randomUUID`. Constructed
-    /// from the `--seed N` value the host passed to
-    /// [`Self::new_with_seed`] (or `0` for [`Self::new`]). See
-    /// [`crate::rng`] for the design; ADR 0008 for the determinism
-    /// contract.
+    /// Per-engine seeded PRNG. Drives the engine's native `Math.random`
+    /// via the C-level `JS_SetRandomSource` hook (ADR 0030) and the
+    /// pure-JS `crypto.getRandomValues` / `crypto.randomUUID` shim
+    /// layered on it. Constructed from the `--seed N` value the host
+    /// passed to [`Self::new_with_seed`] (or `0` for [`Self::new`]). See
+    /// [`crate::rng`] for the design; ADR 0008 / 0030 for the
+    /// determinism contract.
     rng: SeededRng,
+    /// Owns the heap boxes whose addresses the hesojs runtime holds as
+    /// the clock / RNG `opaque` pointers (ADR 0030). Kept alive for the
+    /// runtime's whole life; `Drop` NULLs the sources via
+    /// [`crate::ffi::clear`] before this releases. Prefixed `_` because
+    /// nothing reads it from Rust — it exists for its address + Drop.
+    _determinism: crate::ffi::DeterminismHandles,
     /// Per-engine pending-fetch queue + fetch mode.
     ///
     /// Populated only when the host called [`Self::new_with_fetch`]
@@ -383,15 +404,6 @@ pub(crate) struct XhrState {
     pub(crate) queue: Arc<crate::xhr::XhrQueue>,
     pub(crate) mode: FetchMode,
 }
-
-/// Tracks whether the process-level `TZ=UTC` pin has been applied.
-///
-/// Set once on the first [`JsEngine::new_inner`] call. The pin shapes
-/// QuickJS's Unix-side `localtime_r` behavior (Windows reads the TZ
-/// via `GetTimeZoneInformation` and ignores `TZ` — the JS-side patch
-/// in [`install_date`] carries determinism on both platforms; this
-/// pin is belt-and-suspenders for Unix hosts).
-static UTC_PINNED: Once = Once::new();
 
 impl JsEngine {
     /// Create a fresh engine with conservative resource limits
@@ -581,18 +593,9 @@ impl JsEngine {
         fetch_mode: Option<FetchMode>,
         cookie_jar: Option<Arc<CookieStoreMutex>>,
     ) -> Result<Self, EvalError> {
-        // Pin the process's effective timezone to UTC so QuickJS's
-        // Unix-side Date code (`localtime_r` → `tm.tm_gmtoff`) sees a
-        // zero offset. On Windows QuickJS reads via
-        // `GetTimeZoneInformation` and ignores `TZ`; the JS-side
-        // patch in [`install_date`] is what carries determinism there
-        // and is the same patch we rely on here too — this line is
-        // belt-and-suspenders for Unix hosts. Done at most once via
-        // [`UTC_PINNED`] because `set_var` mutates process-global
-        // state and we don't want to repeat it on every engine
-        // construction.
-        UTC_PINNED.call_once(|| std::env::set_var("TZ", "UTC"));
-
+        // TZ is pinned per-runtime via `JS_SetRuntimeTimezone(rt, "UTC")`
+        // in `ffi::install` below, so this library crate never mutates the
+        // host process environment (ADR 0030).
         let runtime = Runtime::new().map_err(|e| EvalError::Engine(e.to_string()))?;
         runtime.set_memory_limit(DEFAULT_MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(DEFAULT_MAX_STACK_BYTES);
@@ -683,23 +686,47 @@ impl JsEngine {
         timers::install_timers(&context, timers.clone())
             .map_err(|e| EvalError::Engine(format!("install timers: {e}")))?;
 
-        // Determinism shims (ADR 0008): override `Math.random` and
-        // install a `crypto` global with `getRandomValues` and
-        // `randomUUID`. The RNG closures own a [`SeededRng`] clone
-        // (cheap — bumps an Arc refcount), so RNG state lives on the
-        // JS side via the Function objects, not on Rust-held
-        // `Persistent`s. That sidesteps the Runtime-drop ordering trap
-        // that `timers.rs` had to design around.
+        // Determinism injection at the C layer (ADR 0030). The hesojs
+        // fork lets the host supply the clock, RNG, and timezone through
+        // QuickJS's *own* builtins, so there are no JS-side monkey-patches
+        // left to drift between releases:
+        //
+        // - `JS_SetRandomSource` makes the engine's native `Math.random`
+        //   draw its 8 bytes per call from this engine's seeded ChaCha20
+        //   stream (`--seed N`); same seed → byte-identical output.
+        // - `JS_SetClockSource` makes native `Date.now()`, zero-arg
+        //   `new Date()`, `performance.now()`, and `performance.timeOrigin`
+        //   read the shared [`VirtualClock`] that also backs `setTimeout`
+        //   / `setInterval`.
+        // - `JS_SetRuntimeTimezone(rt, "UTC")` pins the effective TZ, so
+        //   the local-time `Date` accessors (`getHours`, `toString`,
+        //   `getTimezoneOffset`) and the multi-arg constructor emit
+        //   host-independent UTC bytes off the *builtin* — the ~150-line
+        //   `WrappedDate` JS shim is gone.
+        // - Stringify byte budget + interrupt poll granularity (PRD §10).
+        //
+        // [`crate::ffi::DeterminismHandles`] owns the heap boxes whose
+        // addresses C holds as `opaque`; it lives in `self` for the
+        // runtime's life and is released (sources NULLed) in `Drop`.
         let rng = SeededRng::new(seed);
-        install_rng(&context, rng.clone())?;
+        let determinism = context
+            .with(|ctx| {
+                crate::ffi::install(
+                    &ctx,
+                    timers.clone(),
+                    rng.clone(),
+                    DEFAULT_MAX_STRINGIFY_BYTES,
+                    DEFAULT_INTERRUPT_POLL_GRANULARITY,
+                )
+            })
+            .map_err(|e| EvalError::Engine(format!("install determinism sources: {e}")))?;
 
-        // Determinism shim for the host wall clock: route `Date.now()`
-        // and zero-arg `new Date()` through the same `VirtualClock`
-        // that backs `setTimeout` / `setInterval`, and pin the engine's
-        // effective TZ to UTC so `new Date(y,m,d,...)`,
-        // `d.getHours()`, `d.toString()`, etc. produce the same bytes
-        // on every host. See [`install_date`].
-        install_date(&context, timers.clone())?;
+        // `crypto` is a web API heso owns — hesojs (correctly) ships no
+        // `crypto` object. The shim is pure JS layered on the
+        // now-deterministic `Math.random`, so it draws from the same
+        // seeded ChaCha20 stream with zero Rust closures on the JS heap.
+        // See [`install_crypto_shim`].
+        install_crypto_shim(&context)?;
 
         // Install `globalThis.location` (and a `globalThis.window`
         // self-reference so `window.location` resolves). Starts as
@@ -737,7 +764,7 @@ impl JsEngine {
         // shim individually; collectively they unblock dozens of init
         // paths on real-world pages that would otherwise throw on a
         // missing global. See [`install_browser_apis`].
-        install_browser_apis(&context, timers.clone())?;
+        install_browser_apis(&context)?;
 
         // Replace the IntersectionObserver noop ctor (registered by
         // `install_browser_apis` for parity with the other observer
@@ -941,6 +968,7 @@ impl JsEngine {
             script_failures,
             timers,
             rng,
+            _determinism: determinism,
             fetch_state,
             xhr_state,
             base_url,
@@ -2243,94 +2271,59 @@ impl Default for JsEngine {
 }
 
 impl Drop for JsEngine {
-    /// Tear the engine down in an order QuickJS's runtime-finalizer
-    /// is happy with.
+    /// Tear the engine down in an order rquickjs and QuickJS's
+    /// runtime-finalizer are both happy with.
     ///
-    /// ## Background: two QuickJS assertions
+    /// ## History (ADR 0030 §Context)
     ///
-    /// Two debug-only assertions in the bundled `quickjs.c` are
-    /// sharp-edged about teardown:
+    /// heso used to paper over an ES2025 iterator-helper shutdown-GC
+    /// cycle (bellard/quickjs#467, CVE-2025-69653) with the
+    /// `disable-assertions` (`-DNDEBUG`) feature plus a four-step
+    /// host-side GC dance. Both are gone — see ADR 0030 for the full
+    /// backstory.
     ///
-    /// - `assert(list_empty(&rt->gc_obj_list))` (`quickjs.c:2205`)
-    ///   fires when `JS_FreeRuntime` walks the GC list and finds
-    ///   externally-referenced objects still alive after its final
-    ///   `JS_RunGC` pass.
-    /// - `assert(p->ref_count > 0)` (`quickjs.c:6183`) fires inside
-    ///   `gc_decref_child` when the GC's cycle-collection pass tries
-    ///   to decrement an object whose ref count is already zero — a
-    ///   classic double-decref.
+    /// ## Now: fixed at the engine layer (ADR 0030)
     ///
-    /// Both reproduce on `https://astro.build/` and
-    /// `https://vercel.com/` without the host-side cleanup below — see
-    /// the in-process reproducers at
-    /// `crates/heso-engine-js/tests/engine_drop_reproducer.rs`.
+    /// The hesojs fork fixes the cycle at its root —
+    /// `js_iterator_helper_mark` walks all four helper GC slots in the
+    /// mark phase (F1) — so `JS_FreeRuntime`'s own shutdown GC breaks it
+    /// cleanly. heso therefore ships with **assertions ON** (no
+    /// `-DNDEBUG`), and this `Drop` no longer pumps microtasks or forces
+    /// GC passes. `tests/engine_drop_reproducer.rs` guards the clean
+    /// drop with assertions live; the engine-level safety net for any
+    /// future hostile-JS leak is `JS_FreeRuntimeForce` (F2).
     ///
-    /// ## The upstream-known root cause
+    /// ## What this `Drop` still does
     ///
-    /// QuickJS's ES2025 iterator helpers (`Iterator.prototype.find`
-    /// etc.) leave a reference-counting cycle when used over a JS
-    /// Array of `Class<T>`-backed Rust objects (in heso's case,
-    /// `Class<Element>` instances from `document.querySelectorAll(…)`)
-    /// that the shutdown GC's mark-and-sweep can't break. This is
-    /// upstream bug bellard/quickjs#467 (CVE-2025-69653). The
-    /// minimal repro is one statement:
-    /// `document.querySelectorAll("span").values().find(e => false)`.
+    /// Two things that are genuine rquickjs ownership requirements, not
+    /// assertion workarounds — both must happen while the runtime is
+    /// still alive:
     ///
-    /// ## How teardown is layered
+    /// 1. **Uninstall the C determinism sources** ([`crate::ffi::clear`])
+    ///    so no finalizer can call back into the soon-to-be-freed clock
+    ///    / RNG opaque boxes.
+    /// 2. **Release host-held `Persistent` handles** — the timer
+    ///    scheduler, the pending-fetch queue, and the dynamic-import
+    ///    resolver closure all hold (or transitively root)
+    ///    `Persistent<Function<'static>>` handles; an rquickjs
+    ///    `Persistent` dropped after its runtime is freed is unsound.
     ///
-    /// Teardown lives in two places:
-    ///
-    /// 1. The `rquickjs/disable-assertions` feature in
-    ///    `crates/heso-engine-js/Cargo.toml` compiles QuickJS with
-    ///    `-DNDEBUG`, which strips the per-object debug asserts so
-    ///    the runtime memory pool can be freed in one shot via
-    ///    `rt->mf.js_free(ms->opaque, rt)` even when the iterator-
-    ///    helper cycle can't be broken. Without this feature, no
-    ///    amount of host-side cleanup is enough for the upstream-
-    ///    bugged path.
-    /// 2. This `Drop` impl performs a four-step host-side cleanup
-    ///    pass that releases everything we *can* release before the
-    ///    runtime drops. With (1) in place, this is what keeps
-    ///    per-engine memory usage from growing across repeated
-    ///    create/drop cycles in the same process.
-    ///
-    /// ## The four-step host-side cleanup
-    ///
-    /// 1. **Release host-held Persistent caches** — the timer
-    ///    scheduler and the pending-fetch queue both hold
-    ///    `Persistent<Function<'static>>` handles. Drain them
-    ///    *inside* `Context::with` so the inner JSValues decref
-    ///    while the parent runtime is still alive.
-    /// 2. **Pump every pending microtask** until QuickJS reports the
-    ///    job queue empty. Promises chained via `.then(...)` in the
-    ///    dynamic-import shim and the fetch closures hold their
-    ///    resolve/reject Persistents in JS-side closure scope;
-    ///    firing those microtasks lets the closures call their
-    ///    resolvers and then become unreachable. Real pages
-    ///    (astro.build, vercel.com) queue dozens of these chains
-    ///    during hydration.
-    /// 3. **Clear engine-owned root references** — most notably the
-    ///    cached module resolver closure, which captures
-    ///    `Rc<RefCell<…>>` handles that, on a freshly-loaded module
-    ///    map, can hold their own Persistents indirectly via the
-    ///    dynamic-import shim. Also `module_cache.try_clear()` for
-    ///    self-describing teardown order.
-    /// 4. **Force a final GC pass** so QuickJS's mark-and-sweep
-    ///    collects everything that the pumped microtasks just made
-    ///    unreachable. Two passes — the first collects unreachable
-    ///    cycles; the second sweeps anything whose finalizer
-    ///    schedules further drops.
-    ///
-    /// The drop sequence is panic-safe: every fallible step uses
-    /// `if let Ok(...)` / best-effort patterns so a single failure
-    /// doesn't skip the rest of the cleanup.
+    /// The sequence is panic-safe: every fallible step uses
+    /// `if let Ok(...)` / best-effort patterns.
     fn drop(&mut self) {
-        // STEP 1. Release host-held Persistents while the runtime is
-        // still alive. The timer scheduler and the pending-fetch queue
-        // both hold `Persistent<Function<'static>>` handles; draining
-        // them inside `ctx.with` is the original anti-Persistent-
-        // footgun fix from when the timers module first landed (see
-        // commit `engine-js: real document.cookie wired …` ancestor).
+        // STEP 0. Uninstall the C-level clock/RNG sources (ADR 0030)
+        // before anything else, so nothing running during the runtime's
+        // shutdown GC can call back into the heap boxes that
+        // `_determinism` is about to free.
+        self.context.with(|ctx| crate::ffi::clear(&ctx));
+
+        // STEP 1. Release host-held `Persistent<Function<'static>>`
+        // handles while the runtime is still alive. The timer scheduler
+        // and the pending-fetch queue both hold them; an rquickjs
+        // `Persistent` dropped *after* its runtime is freed is unsound,
+        // so they must be drained here, inside `ctx.with`, rather than
+        // at field-drop time. This is a real rquickjs ownership
+        // requirement, independent of the assertion saga below.
         let timers = self.timers.clone();
         let fetch_queue = self.fetch_state.as_ref().map(|fs| fs.queue.clone());
         self.context.with(|_ctx| {
@@ -2342,58 +2335,18 @@ impl Drop for JsEngine {
             }
         });
 
-        // STEP 2. Pump the microtask queue to empty. Bounded so a
-        // pathological self-rescheduling microtask can't hang teardown
-        // — but generous enough for normal page hydration which can
-        // chain dozens of `.then(...)` calls across a single tick.
-        const MAX_DROP_PUMP: usize = 10_000;
-        for _ in 0..MAX_DROP_PUMP {
-            match self._runtime.execute_pending_job() {
-                Ok(true) => continue,
-                // Either the queue is empty or a job threw. Either way
-                // we stop pumping — a thrown job has already had its
-                // exception consumed by QuickJS, and we don't want to
-                // leak the next-job pointer past the throw.
-                _ => break,
-            }
-        }
-
-        // STEP 3. Release engine-owned root references that would
-        // otherwise keep JS objects alive past the runtime drop.
-        //
-        // The dynamic-import default resolver closure captures
-        // `Rc<RefCell<…>>` handles to the `ModuleCache` and the
-        // `SharedImportMap`; both are plain-data structures, but the
-        // closure box itself is in `module_resolver: Arc<Mutex<…>>`
-        // which we share with the JS-side `globalThis.import` shim.
-        // Clearing the slot here drops the closure (and its captures)
-        // synchronously, so any Persistent indirectly rooted via the
-        // closure releases now rather than at the runtime drop.
+        // STEP 2. Drop the dynamic-import resolver closure (it captures
+        // `Rc<RefCell<…>>` handles that can indirectly root Persistents)
+        // and the module cache, again while the runtime is alive.
         if let Ok(mut guard) = self.module_resolver.lock() {
             *guard = None;
         }
-        // The module cache holds (URL → source) entries — pure data,
-        // no Persistents — but clearing it here drops any
-        // QuickJS-internal module objects that the cache's source
-        // strings indirectly fed into via `Module::declare`. Pure
-        // belt-and-braces; the assertion has not been observed to
-        // root in this state on its own, but the cost is negligible
-        // and the cleanup boundary is now self-describing.
         self.module_cache.try_clear();
 
-        // STEP 4. Force a final mark-and-sweep so any cycle that the
-        // microtask pump just made unreachable gets collected while
-        // the runtime is still alive. This is the load-bearing step
-        // for the `gc_obj_list != empty` assertion on real pages:
-        // module evaluators chain into `Promise.then(…)` closures that
-        // chain into `RustFunction<'static>` boxes — left to its own
-        // devices, the runtime's shutdown GC walks these in an order
-        // that trips the `gc_decref_child` assertion. Running the GC
-        // *before* shutdown lets QuickJS sweep them cleanly. Two
-        // passes — the first collects unreachable cycles; the second
-        // sweeps anything whose finalizer schedules further drops.
-        self._runtime.run_gc();
-        self._runtime.run_gc();
+        // rquickjs's `Runtime` `Drop` then calls `JS_FreeRuntime`, whose
+        // shutdown GC breaks the old iterator-helper / `Class<T>` cycle
+        // cleanly (hesojs F1) — no host-side GC dance needed. See the
+        // doc-comment above and ADR 0030.
     }
 }
 
@@ -3109,421 +3062,91 @@ fn install_console(
     Ok(())
 }
 
-/// Install the seeded-RNG determinism shims onto the context's
-/// globals (per ADR 0008):
+/// Install the `crypto` web API as a pure-JS shim layered on the
+/// now-deterministic `Math.random` (ADR 0030).
 ///
-/// 1. **`Math.random`** — replaced with a closure that draws the next
-///    `f64` from the engine's [`SeededRng`]. JS code calling
-///    `Math.random()` therefore sees the same sequence on every run
-///    with the same seed.
-/// 2. **`crypto.getRandomValues(view)`** — fills the bytes of the
-///    passed `Uint8Array` (or any typed-array-shaped object with a
-///    `length`) from the same stream. Returns the view, matching the
-///    [WebCrypto spec](https://www.w3.org/TR/WebCryptoAPI/#Crypto-method-getRandomValues).
-///    Implementation note: rather than poking at the underlying
-///    `ArrayBuffer` via raw pointers (the crate forbids
-///    `unsafe_code`), we use indexed `Object::set` — JS engines route
-///    `arr[i] = byte` on a TypedArray to the backing buffer, so this
-///    is observably equivalent without unsafe.
-/// 3. **`crypto.randomUUID()`** — returns a v4-format UUID whose 16
-///    bytes come from the same stream.
+/// The engine's `Math.random` is seeded at the C layer via
+/// `JS_SetRandomSource` ([`crate::ffi`]), drawing from this engine's
+/// ChaCha20 [`SeededRng`]. So `crypto` needs no Rust closure of its own
+/// — it consumes the same stream by calling `Math.random`. Two surfaces,
+/// matching the WebCrypto spec shape:
 ///
-/// `Date.now`, `new Date()`, and the engine's effective timezone are
-/// routed separately by [`install_date`], which shares the
-/// [`VirtualClock`](crate::timers) backing `setTimeout` /
-/// `setInterval` and pins the effective TZ to UTC so explicit-input
-/// `Date` forms (`new Date(ms)`, `new Date(str)`, `new Date(y,m,d,...)`,
-/// `Date.parse`, `Date.UTC`) produce host-independent bytes.
-fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
+/// 1. **`crypto.getRandomValues(view)`** — fills the typed array in
+///    place (one byte per `Math.random()` draw, capped at the spec's
+///    65536-byte limit) and returns it.
+/// 2. **`crypto.randomUUID()`** — a v4 UUID built from 16 such bytes
+///    with the version (`4`) and variant (`10xx`) bits forced per
+///    RFC 4122 §4.4.
+///
+/// `crypto` is a web API heso owns; hesojs ships no `crypto` object (an
+/// engine builtin would be wrong layering), so there is nothing to
+/// override — we install onto a fresh global. The clock + timezone are
+/// injected separately at the C layer in [`JsEngine::new_inner`].
+fn install_crypto_shim(context: &Context) -> Result<(), EvalError> {
+    // Pure JS, no Rust closure: `Math.random` is already seeded at the C
+    // layer via `JS_SetRandomSource` (see [`crate::ffi`]), so drawing
+    // each byte from `Math.random()` consumes the same ChaCha20 stream —
+    // `crypto` and `Math.random` share one deterministic entropy source.
+    //
+    // Determinism epoch note (ADR 0030): each output byte costs one
+    // 8-byte ChaCha draw (via one `Math.random()` f64), so `crypto`'s
+    // byte output for a given seed differs from the pre-0030 Rust
+    // `fill_bytes` shim. That is an intentional epoch break — output is
+    // still byte-identical for a fixed (seed, engine version); cassettes
+    // are re-stamped on the engine bump. Past the WebCrypto 65536-byte
+    // cap we throw `QuotaExceededError` like a real browser.
+    const CRYPTO_SHIM: &str = r#"
+        (function () {
+            const MAX = 65536;
+            const crypto = {};
+            crypto.getRandomValues = function (view) {
+                if (view == null || typeof view.length !== 'number') {
+                    return view;
+                }
+                const len = view.length >>> 0;
+                // WebCrypto caps a single call at 65536 bytes and throws
+                // QuotaExceededError past it — match real browsers rather
+                // than silently truncating (a library may rely on the
+                // throw to detect an oversized request).
+                if (len > MAX) {
+                    var msg = "Failed to execute 'getRandomValues' on 'Crypto': " +
+                        "The ArrayBufferView's byte length (" + len +
+                        ") exceeds the number of bytes of entropy available (" + MAX + ").";
+                    throw (typeof DOMException !== 'undefined')
+                        ? new DOMException(msg, 'QuotaExceededError')
+                        : new Error(msg);
+                }
+                for (let i = 0; i < len; i++) {
+                    view[i] = (Math.random() * 256) | 0;
+                }
+                return view;
+            };
+            crypto.randomUUID = function () {
+                const b = new Uint8Array(16);
+                crypto.getRandomValues(b);
+                b[6] = (b[6] & 0x0f) | 0x40; // version 4
+                b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+                const h = [];
+                for (let i = 0; i < 256; i++) {
+                    h.push((i + 0x100).toString(16).slice(1));
+                }
+                return (
+                    h[b[0]] + h[b[1]] + h[b[2]] + h[b[3]] + '-' +
+                    h[b[4]] + h[b[5]] + '-' +
+                    h[b[6]] + h[b[7]] + '-' +
+                    h[b[8]] + h[b[9]] + '-' +
+                    h[b[10]] + h[b[11]] + h[b[12]] + h[b[13]] + h[b[14]] + h[b[15]]
+                );
+            };
+            globalThis.crypto = crypto;
+        })()
+    "#;
     context
         .with(|ctx| -> rquickjs::Result<()> {
-            let globals = ctx.globals();
-
-            // ---- Math.random ----
-            //
-            // Reach for the existing `Math` object so we don't replace
-            // it (and lose Math.floor, Math.abs, etc.). Overriding the
-            // `random` property leaves the rest of Math intact.
-            let math: Object = globals.get("Math")?;
-            let math_random_rng = rng.clone();
-            let math_random = Func::from(move || math_random_rng.next_f64());
-            math.set("random", math_random)?;
-
-            // ---- crypto ----
-            //
-            // We unconditionally install a fresh `crypto` object.
-            // QuickJS doesn't ship one by default, and even if a host
-            // ever pre-populates it the determinism contract requires
-            // ours to win.
-            let crypto = Object::new(ctx.clone())?;
-
-            // crypto.getRandomValues(view: Uint8Array) -> view
-            //
-            // We accept the view as a generic [`Object`] (which is
-            // what a Uint8Array is at the JS level) so we don't need
-            // an rquickjs `TypedArray<u8>` import; we read its
-            // `length` and write each byte via indexed `Object::set`.
-            // QuickJS routes indexed writes on a TypedArray to its
-            // backing buffer, so `view[i]` on the JS side sees the
-            // filled bytes.
-            // crypto.getRandomValues(view) — fills the buffer in-place
-            // and returns the view, per the WebCrypto spec. We return
-            // `()` from the Rust side because returning the same
-            // `Object<'js>` we received trips an
-            // independent-lifetime mismatch in rquickjs's `Func::from`
-            // HRTB inference (the closure's input and return lifetimes
-            // don't unify with `Object` being invariant). Side-effects
-            // (the fill) are the load-bearing part; we re-attach the
-            // "return the view" half from JS by wrapping the binding in
-            // a tiny preamble below so `crypto.getRandomValues(v)`
-            // still produces `v`.
-            let gv_rng = rng.clone();
-            let get_random_values_raw = Func::from(move |view: Object<'_>| {
-                let len: usize = match view.get::<_, usize>("length") {
-                    Ok(n) => n,
-                    // No `length` property → silently no-op (matches
-                    // "throw on bad arg" being more disruptive than
-                    // the spec strictly requires for a determinism
-                    // shim).
-                    Err(_) => return,
-                };
-                if len == 0 {
-                    return;
-                }
-                // Cap at a sane size to avoid a runaway allocator on
-                // huge requests. The WebCrypto spec caps at 65536; we
-                // honor that.
-                const MAX_LEN: usize = 65_536;
-                let effective = len.min(MAX_LEN);
-                let mut buf = vec![0u8; effective];
-                gv_rng.fill_bytes(&mut buf);
-                for (i, byte) in buf.iter().enumerate() {
-                    // Best-effort: if a particular index set fails
-                    // (e.g. the view is read-only), we skip it rather
-                    // than abort the fill. `effective <= 65_536` so
-                    // the cast to u32 is loss-free.
-                    let _ = view.set(i as u32, *byte);
-                }
-            });
-            // Install the raw fill function on the crypto object
-            // under a private name; the JS-side wrap below renames it
-            // to the spec-shape `getRandomValues` that returns the
-            // view.
-            crypto.set("__getRandomValuesRaw", get_random_values_raw)?;
-
-            // crypto.randomUUID() -> string
-            let uuid_rng = rng.clone();
-            let random_uuid = Func::from(move || uuid_rng.random_uuid());
-            crypto.set("randomUUID", random_uuid)?;
-
-            // Publish the crypto global before running the wrap script
-            // so the script can reach it.
-            globals.set("crypto", crypto)?;
-
-            // Wrap the raw fill function so the spec-shape
-            // `crypto.getRandomValues(view)` returns `view`. The Rust
-            // side returns `()` because rquickjs's `Func::from` HRTB
-            // can't unify the input and return Object lifetimes when
-            // both are anonymous; the JS wrapper re-attaches the
-            // "return the view" half cheaply.
-            let wrap_src = r#"
-                (function() {
-                    const raw = globalThis.crypto.__getRandomValuesRaw;
-                    globalThis.crypto.getRandomValues = function(view) {
-                        raw(view);
-                        return view;
-                    };
-                    delete globalThis.crypto.__getRandomValuesRaw;
-                })()
-            "#;
-            ctx.eval::<(), _>(wrap_src)?;
-
+            ctx.eval::<(), _>(CRYPTO_SHIM)?;
             Ok(())
         })
-        .map_err(|e| EvalError::Engine(format!("install rng: {e}")))?;
-    Ok(())
-}
-
-/// Install the deterministic `Date` shim onto the context's globals
-/// (per [ADR 0008]).
-///
-/// The engine's effective timezone is **always UTC** — every
-/// JavaScript-visible `Date` reading produces the same bytes regardless
-/// of the host machine's timezone. This is what makes the determinism
-/// contract hold across hosts: a page that does
-/// `new Date(2024, 0, 15).getTime()` produces `1705276800000` on every
-/// machine, not the host-TZ-shifted value QuickJS's built-in would
-/// otherwise return.
-///
-/// Three surfaces are intercepted; everything else stays on QuickJS's
-/// built-in `Date`:
-///
-/// 1. **`Date.now()`** — returns the current
-///    [`VirtualClock`](crate::timers) reading as an `f64`, matching
-///    the spec's "milliseconds since the Unix epoch" shape. Because
-///    the clock starts at zero on a fresh engine, `Date.now()` on a
-///    just-constructed engine is `0` — i.e. midnight 1970-01-01 UTC.
-///    The host can shift this by either calling
-///    [`JsEngine::advance_clock`] (the same control surface as timers)
-///    or by setting an initial epoch via a future
-///    `new_with_seed_and_epoch_ms` constructor — both are valid; both
-///    keep determinism.
-///
-/// 2. **`new Date()`** (zero-arg construction) — pins the constructed
-///    `Date` instance to the same virtual time.
-///
-/// 3. **`new Date(y, m, d, ...)`** (multi-arg construction) — args are
-///    interpreted as UTC (forwarded through `Date.UTC(...)`) rather
-///    than the host's local timezone. `new Date(ms)` and
-///    `new Date(str)` are already TZ-independent at construction time
-///    and pass through unchanged.
-///
-/// On the prototype side, every local-time accessor and mutator —
-/// `getHours`, `getDate`, `getMonth`, `getFullYear`, `getDay`,
-/// `getMinutes`, `getSeconds`, `getMilliseconds`, `getYear`,
-/// `getTimezoneOffset`, the matching `setX` family, and the rendered
-/// forms `toString` / `toDateString` / `toTimeString` /
-/// `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString` —
-/// delegates to its UTC counterpart (or returns a UTC-formatted
-/// string). `getTimezoneOffset` returns `0`. `toString` returns the
-/// `toISOString` form so the rendered text is stable across hosts.
-///
-/// HESO/1.0 §5.4.3 says explicit-input Date forms "MUST NOT read the
-/// virtual clock" and "MUST leave these forms on the underlying
-/// JavaScript engine's built-in Date without modification." The
-/// virtual-clock half is honored verbatim: the multi-arg constructor
-/// never reads `Date.now()` or the virtual clock. The
-/// no-modification half is the tension the spec did not anticipate —
-/// QuickJS's built-in multi-arg constructor reads the host TZ via
-/// `GetTimeZoneInformation` on Windows and `localtime_r` on Unix, so
-/// "no modification" and "byte-identical `plat_hash` across hosts"
-/// (§5.7 conformance) are mutually exclusive. We honor conformance
-/// because that is the property the spec exists to guarantee.
-///
-/// ## Why this shape (monkey-patch over JS)
-///
-/// QuickJS's `Date` is implemented in C and built into the runtime;
-/// there's no clean rquickjs API to swap out the constructor's
-/// host-time-reading code path. The idiomatic move (matching
-/// `sinon.useFakeTimers` and `happy-dom`'s fake clock) is to leave
-/// the original `Date` intact and replace `globalThis.Date` with a
-/// thin JS wrapper that forwards every form except the zero-arg
-/// constructor to the original, and the zero-arg constructor to
-/// `new OriginalDate(Date.now())`. `Date.prototype` and the static
-/// surface (`Date.parse`, `Date.UTC`, `Date.now`) are copied across
-/// so `instanceof Date`, `Date.parse('...')`, etc. still work.
-///
-/// We rebind `Date.now` first (Rust closure → `VirtualClock.now_ms`)
-/// then run a tiny JS bootstrap that builds the wrapper using the
-/// rebound `Date.now`. The wrapper itself is JS so it stays inside
-/// the QuickJS sandbox — no Rust callback per construction.
-///
-/// [ADR 0008]: ../../decisions/0008-deterministic-execution.md
-fn install_date(
-    context: &Context,
-    timers: Arc<Mutex<TimerScheduler>>,
-) -> Result<(), EvalError> {
-    context
-        .with(|ctx| -> rquickjs::Result<()> {
-            let globals = ctx.globals();
-
-            // Step 1: replace `Date.now` on the *original* Date with a
-            // closure that reads the shared VirtualClock. The wrapper
-            // built in step 2 then copies this Date.now onto itself.
-            //
-            // The clock is read under the scheduler lock; on a poisoned
-            // mutex (effectively unreachable — single-threaded engine)
-            // we fall back to `0.0` rather than panic.
-            let now_timers = timers.clone();
-            let date_now = Func::from(move || -> f64 {
-                match now_timers.lock() {
-                    Ok(s) => s.now_ms() as f64,
-                    Err(_) => 0.0,
-                }
-            });
-            let date_obj: Object = globals.get("Date")?;
-            date_obj.set("now", date_now)?;
-
-            // Step 2: build the JS-side wrapper around the original
-            // Date. The wrapper:
-            //
-            //   - intercepts zero-arg `new Date()` → returns
-            //     `new OriginalDate(Date.now())` (which now reads the
-            //     virtual clock).
-            //   - routes multi-arg `new Date(y, m, d, ...)` through
-            //     `Date.UTC(...)` so the args are interpreted as UTC
-            //     rather than the host's local timezone.
-            //   - forwards `new Date(ms)` and `new Date(str)` through
-            //     unchanged — both are TZ-independent at construction.
-            //   - forwards calls without `new` (`Date()` returns a
-            //     string in the spec) by stringifying the virtual-clock
-            //     reading via `toISOString` so the rendered text is
-            //     stable across hosts.
-            //   - preserves `Date.prototype` so `instanceof Date` keeps
-            //     working for both zero-arg and explicit-input
-            //     instances.
-            //   - copies the static surface (`now`, `parse`, `UTC`)
-            //     across so `Date.parse` / `Date.UTC` / `Date.now`
-            //     still resolve.
-            //   - rebinds every local-time prototype accessor / mutator
-            //     / rendered-string form to its UTC counterpart so a
-            //     page that calls `d.getHours()` or `d.toString()`
-            //     observes UTC regardless of the host's `TZ`.
-            //
-            // Note: we copy *all* own properties of the original Date
-            // (rather than hardcoding {now, parse, UTC}) so any future
-            // QuickJS-side additions ride along automatically.
-            let bootstrap = r#"
-                (function() {
-                    const OriginalDate = globalThis.Date;
-                    function WrappedDate(...args) {
-                        // Called without `new` — per the spec,
-                        // `Date(...)` returns a string representation
-                        // of the current time, ignoring its arguments.
-                        // Pin to the virtual clock and stringify via
-                        // toISOString so the rendered text doesn't
-                        // depend on the host TZ.
-                        if (!(this instanceof WrappedDate)) {
-                            return new OriginalDate(OriginalDate.now()).toISOString();
-                        }
-                        // Zero-arg construction: pin to virtual clock.
-                        if (args.length === 0) {
-                            return new OriginalDate(OriginalDate.now());
-                        }
-                        // Single-arg forms (`new Date(ms)` and
-                        // `new Date(str)`) are TZ-independent at the
-                        // constructor — `ms` is already UTC-epoch and
-                        // `str` is parsed per ISO 8601 / RFC 2822
-                        // rules that carry their own zone. Pass
-                        // through unchanged.
-                        if (args.length === 1) {
-                            return new OriginalDate(args[0]);
-                        }
-                        // Multi-arg form (`new Date(y, m, d, h, m, s,
-                        // ms)`) is local-time on the built-in. Route
-                        // through `Date.UTC` so the same args land on
-                        // the same epoch ms regardless of host TZ.
-                        // `Date.UTC` applies the year < 100 → +1900
-                        // adjustment internally, matching the built-in
-                        // constructor's adjustment for the same case.
-                        return new OriginalDate(OriginalDate.UTC(...args));
-                    }
-                    // Preserve prototype identity so
-                    // `instanceof Date` works for instances created
-                    // by both the wrapper and the original (the
-                    // wrapper returns instances constructed by the
-                    // original, so they're `instanceof OriginalDate`
-                    // already; by aliasing prototypes we also satisfy
-                    // `instanceof WrappedDate`).
-                    WrappedDate.prototype = OriginalDate.prototype;
-                    // Copy the static surface (now, parse, UTC, and
-                    // any future additions) onto the wrapper.
-                    for (const key of Object.getOwnPropertyNames(OriginalDate)) {
-                        if (key === 'length' || key === 'name' || key === 'prototype') {
-                            continue;
-                        }
-                        const desc = Object.getOwnPropertyDescriptor(OriginalDate, key);
-                        if (desc) {
-                            Object.defineProperty(WrappedDate, key, desc);
-                        }
-                    }
-                    globalThis.Date = WrappedDate;
-
-                    // Rebind local-time prototype methods to their UTC
-                    // counterparts. This is what stops cross-machine
-                    // divergence on a page that reads `d.getHours()` /
-                    // `d.toString()` after constructing a Date by any
-                    // path (multi-arg, single-arg, or zero-arg).
-                    // `getTimezoneOffset` returns 0 because the
-                    // engine's effective offset is UTC.
-                    const proto = OriginalDate.prototype;
-                    const localToUtc = {
-                        getFullYear: 'getUTCFullYear',
-                        getMonth: 'getUTCMonth',
-                        getDate: 'getUTCDate',
-                        getDay: 'getUTCDay',
-                        getHours: 'getUTCHours',
-                        getMinutes: 'getUTCMinutes',
-                        getSeconds: 'getUTCSeconds',
-                        getMilliseconds: 'getUTCMilliseconds',
-                        setFullYear: 'setUTCFullYear',
-                        setMonth: 'setUTCMonth',
-                        setDate: 'setUTCDate',
-                        setHours: 'setUTCHours',
-                        setMinutes: 'setUTCMinutes',
-                        setSeconds: 'setUTCSeconds',
-                        setMilliseconds: 'setUTCMilliseconds',
-                    };
-                    for (const [local, utc] of Object.entries(localToUtc)) {
-                        const utcFn = proto[utc];
-                        if (typeof utcFn === 'function') {
-                            proto[local] = function (...rest) {
-                                return utcFn.apply(this, rest);
-                            };
-                        }
-                    }
-                    // `getYear` is the legacy (pre-Y2K) accessor:
-                    // returns (UTCFullYear - 1900). Implement directly.
-                    proto.getYear = function () {
-                        return proto.getUTCFullYear.call(this) - 1900;
-                    };
-                    // `setYear` mirrors the legacy form: takes a year
-                    // value that is either a 2-digit year (0-99,
-                    // interpreted as 19xx) or a full year, and updates
-                    // the UTC year while keeping month/day/time.
-                    proto.setYear = function (year) {
-                        const y = Number(year);
-                        if (!isFinite(y)) {
-                            return proto.setTime.call(this, NaN);
-                        }
-                        const adjusted = (y >= 0 && y <= 99) ? y + 1900 : y;
-                        return proto.setUTCFullYear.call(this, adjusted);
-                    };
-                    // The engine renders every Date in UTC. Match the
-                    // toString shape browsers produce (toUTCString-ish)
-                    // by routing toString, toDateString, toTimeString,
-                    // and the toLocale* family through the existing
-                    // UTC-formatted accessors.
-                    proto.toString = function () {
-                        return proto.toUTCString.call(this);
-                    };
-                    proto.toDateString = function () {
-                        const s = proto.toUTCString.call(this);
-                        // toUTCString shape: "Mon, 15 Jan 2024 00:00:00 GMT"
-                        // toDateString shape: "Mon Jan 15 2024".
-                        // Reconstruct from UTC accessors to keep the
-                        // shape predictable.
-                        const wd = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][proto.getUTCDay.call(this)];
-                        const mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][proto.getUTCMonth.call(this)];
-                        const d2 = String(proto.getUTCDate.call(this)).padStart(2, '0');
-                        const y = proto.getUTCFullYear.call(this);
-                        return wd + ' ' + mo + ' ' + d2 + ' ' + y;
-                    };
-                    proto.toTimeString = function () {
-                        const h = String(proto.getUTCHours.call(this)).padStart(2, '0');
-                        const m = String(proto.getUTCMinutes.call(this)).padStart(2, '0');
-                        const s = String(proto.getUTCSeconds.call(this)).padStart(2, '0');
-                        return h + ':' + m + ':' + s + ' GMT+0000 (Coordinated Universal Time)';
-                    };
-                    proto.toLocaleString = function () {
-                        return proto.toISOString.call(this);
-                    };
-                    proto.toLocaleDateString = function () {
-                        return proto.toDateString.call(this);
-                    };
-                    proto.toLocaleTimeString = function () {
-                        return proto.toTimeString.call(this);
-                    };
-                    proto.getTimezoneOffset = function () {
-                        return 0;
-                    };
-                })()
-            "#;
-            ctx.eval::<(), _>(bootstrap)?;
-
-            Ok(())
-        })
-        .map_err(|e| EvalError::Engine(format!("install date: {e}")))?;
+        .map_err(|e| EvalError::Engine(format!("install crypto shim: {e}")))?;
     Ok(())
 }
 
@@ -3984,12 +3607,8 @@ const STYLE_PROXY_BOOTSTRAP: &str = r#"
 ///   (0.22 — `Engine::decode` / `Engine::encode` with the standard
 ///   alphabet). Invalid input throws a plain `Error` for now; a full
 ///   `DOMException('InvalidCharacterError')` is a later concern.
-fn install_browser_apis(
-    context: &Context,
-    timers: Arc<Mutex<TimerScheduler>>,
-) -> Result<(), EvalError> {
+fn install_browser_apis(context: &Context) -> Result<(), EvalError> {
     use base64::Engine as _;
-    let perf_timers = timers.clone();
     context
         .with(|ctx| -> rquickjs::Result<()> {
             let globals = ctx.globals();
@@ -4024,26 +3643,29 @@ fn install_browser_apis(
             navigator.set("appVersion", "5.0 (X11; Linux x86_64)")?;
             globals.set("navigator", navigator)?;
 
-            // ---- performance.now() ----
+            // ---- performance.now() / timeOrigin ----
             //
-            // Reads the same VirtualClock that backs Date.now and the
-            // timer scheduler. Determinism: same advance_clock sequence
-            // → same performance.now() readings across engines.
-            let perf = Object::new(ctx.clone())?;
-            let now_fn = Func::from(move || -> f64 {
-                match perf_timers.lock() {
-                    Ok(s) => s.now_ms() as f64,
-                    Err(_) => 0.0,
-                }
-            });
-            perf.set("now", now_fn)?;
-            // performance.timeOrigin: real browsers expose this as "ms
-            // since UNIX epoch when navigation started". heso's virtual
-            // clock starts at 0 so timeOrigin = 0 keeps the invariant
-            // `Date.now() === performance.timeOrigin + performance.now()`
-            // true on a fresh engine.
-            perf.set("timeOrigin", 0.0_f64)?;
-            globals.set("performance", perf)?;
+            // Pure JS over the now-C-virtual `Date.now()` (clock source,
+            // ADR 0030). hesojs ships a native `performance` whose `now`
+            // and `timeOrigin` are read-only data properties, and whose
+            // `timeOrigin` is captured during context construction —
+            // *before* heso installs the clock source — so it holds a
+            // stale host wall-clock value we can neither use nor
+            // overwrite in place. So we replace the whole global (the
+            // `performance` global slot is writable) with a fresh,
+            // extensible object: `timeOrigin = 0` and
+            // `now() = Date.now()` keep the invariant
+            // `Date.now() === timeOrigin + now()` true on the virtual
+            // clock, with no Rust closure. Later code (mark/measure,
+            // requestAnimationFrame) layers onto this object.
+            ctx.eval::<(), _>(
+                r#"(function () {
+                    globalThis.performance = {
+                        now: function () { return Date.now(); },
+                        timeOrigin: 0,
+                    };
+                })()"#,
+            )?;
 
             // ---- atob / btoa ----
             //
@@ -8410,6 +8032,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crypto_get_random_values_enforces_webcrypto_quota() {
+        // WebCrypto caps a single getRandomValues call at 65536 bytes:
+        // exactly the cap fills and returns the view; one byte past it
+        // throws (QuotaExceededError in a browser), per ADR 0030.
+        let e = JsEngine::new_with_seed(7).expect("engine seed 7");
+        let at_cap = e
+            .eval("crypto.getRandomValues(new Uint8Array(65536)).length")
+            .expect("65536 bytes is within quota");
+        assert_eq!(at_cap.value, serde_json::json!(65536));
+        let past_cap = e.eval("crypto.getRandomValues(new Uint8Array(65537))");
+        assert!(
+            past_cap.is_err(),
+            "getRandomValues past the 65536-byte quota must throw, got {past_cap:?}"
+        );
+    }
+
     // ===== Phase 1C script-on-load integration tests =====
     //
     // These pin the load-bearing behavior of the script pump:
@@ -8949,10 +8588,17 @@ mod tests {
     fn date_string_renderers_emit_utc_form() {
         // `toString`, `toDateString`, `toTimeString`, and the
         // `toLocale*` family must produce UTC-rendered text so the
-        // engine's stringified Date bytes are stable across hosts.
-        // A page that bakes one of these into the DOM (e.g.
+        // engine's stringified Date bytes are stable across hosts. A
+        // page that bakes one of these into the DOM (e.g.
         // `document.title = new Date(...).toString()`) would otherwise
         // drift between machines.
+        //
+        // Since ADR 0030 these are the engine's *native* hesojs
+        // renderers with the runtime timezone pinned to UTC
+        // (`JS_SetRuntimeTimezone`), not a JS `WrappedDate` shim. The
+        // bytes below are the real-browser-shaped output (no Intl, so
+        // `toLocale*` uses the engine's fixed root-locale format) and
+        // are identical on every host because the offset is always 0.
         let e = engine();
         let out = e
             .eval(
@@ -8971,31 +8617,16 @@ mod tests {
                 })()"#,
             )
             .expect("eval ok");
-        // `toString` mirrors `toUTCString`, so the two fields are the
-        // exact same bytes. `toLocaleString` mirrors `toISOString`.
-        // The other three follow the reconstructed UTC shape installed
-        // by the shim.
         let m = out.value.as_object().expect("object");
-        assert_eq!(
-            m.get("toString").and_then(|v| v.as_str()),
-            m.get("toUTCString").and_then(|v| v.as_str())
-        );
-        assert_eq!(
-            m.get("toLocaleString").and_then(|v| v.as_str()),
-            m.get("toISOString").and_then(|v| v.as_str())
-        );
-        assert_eq!(
-            m.get("toDateString").and_then(|v| v.as_str()),
-            Some("Thu Jan 01 1970")
-        );
-        assert_eq!(
-            m.get("toLocaleDateString").and_then(|v| v.as_str()),
-            Some("Thu Jan 01 1970")
-        );
-        assert_eq!(
-            m.get("toTimeString").and_then(|v| v.as_str()),
-            Some("00:00:00 GMT+0000 (Coordinated Universal Time)")
-        );
+        let get = |k: &str| m.get(k).and_then(|v| v.as_str());
+        assert_eq!(get("toString"), Some("Thu Jan 01 1970 00:00:00 GMT+0000"));
+        assert_eq!(get("toUTCString"), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert_eq!(get("toDateString"), Some("Thu Jan 01 1970"));
+        assert_eq!(get("toTimeString"), Some("00:00:00 GMT+0000"));
+        assert_eq!(get("toLocaleString"), Some("01/01/1970, 12:00:00 AM"));
+        assert_eq!(get("toLocaleDateString"), Some("01/01/1970"));
+        assert_eq!(get("toLocaleTimeString"), Some("12:00:00 AM"));
+        assert_eq!(get("toISOString"), Some("1970-01-01T00:00:00.000Z"));
     }
 
     #[test]

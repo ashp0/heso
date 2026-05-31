@@ -22,29 +22,15 @@
 //! leaves a reference-counting cycle that QuickJS's mark-and-sweep
 //! shutdown GC can't break. See bellard/quickjs#467 / CVE-2025-69653.
 //!
-//! ## What the fix does
+//! ## What the fix does (ADR 0030)
 //!
-//! Two complementary layers:
-//!
-//! 1. **`rquickjs/disable-assertions` feature** (Cargo.toml) — compiles
-//!    QuickJS with `-DNDEBUG`, which strips the per-object book-
-//!    keeping assertions. The runtime still walks the GC list, runs
-//!    finalizers where it can, and frees the entire allocator pool in
-//!    one shot via `rt->mf.js_free(ms->opaque, rt)`. Net effect: any
-//!    leaked GC object's memory is reclaimed at runtime drop just as
-//!    completely as if the assertion had passed.
-//! 2. **Explicit `Drop` impl on [`JsEngine`]** (`engine.rs`) — drains
-//!    host-held `Persistent<T>` caches (timers + fetch queue), pumps
-//!    pending microtasks until idle, clears engine-owned root refs
-//!    (module resolver + cache), then forces a final `run_gc()` so
-//!    the cycles that NDEBUG would otherwise let pass are minimized
-//!    in the normal (non-pathological) case.
-//!
-//! Without (1), step (2) is insufficient — the upstream-bugged cycle
-//! survives any number of host-side GC passes. Without (2), an
-//! NDEBUG build still leaks memory on every engine drop because the
-//! Persistent caches sit on globalThis and never become unreachable.
-//! Both are required.
+//! Fixed at the engine layer: hesojs's `js_iterator_helper_mark` walks
+//! all four iterator-helper GC slots (F1), so `JS_FreeRuntime`'s own
+//! shutdown GC breaks the cycle cleanly. heso ships with **assertions
+//! ON** (the `disable-assertions` `-DNDEBUG` feature is gone) — so these
+//! tests run against the real asserts: a regression aborts here rather
+//! than passing silently. See ADR 0030 for the deleted host-side dance
+//! and `JS_FreeRuntimeForce` (F2), the engine-level leak safety net.
 //!
 //! ## Minimal repro shape
 //!

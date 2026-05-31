@@ -1,10 +1,12 @@
 //! # rng
 //!
 //! Seeded pseudo-random number generator backing the JS engine's
-//! determinism shims, per [ADR 0008]. Wraps a single
-//! [`rand_chacha::ChaCha20Rng`] behind an [`Arc`]`<`[`Mutex`]`>` so the
-//! JS-side `Math.random`, `crypto.getRandomValues`, and
-//! `crypto.randomUUID` closures can all draw from the same stream.
+//! determinism, per [ADR 0008]. Wraps a single
+//! [`rand_chacha::ChaCha20Rng`] behind an [`Arc`]`<`[`Mutex`]`>` and
+//! feeds the engine's native `Math.random` through the C-layer
+//! `JS_SetRandomSource` hook (ADR 0030); `crypto.getRandomValues` /
+//! `crypto.randomUUID` are a pure-JS shim over that same `Math.random`,
+//! so every random surface draws from this one stream.
 //!
 //! ## Why ChaCha20
 //!
@@ -22,9 +24,9 @@
 //!
 //! ## Threading
 //!
-//! The JS engine is single-threaded; the [`Mutex`] is interior-mutability
-//! for the multiple closures (Math.random, crypto.getRandomValues,
-//! crypto.randomUUID) that share the same RNG, not for cross-thread
+//! The JS engine is single-threaded; the [`Mutex`] is interior
+//! mutability so the C random source's [`fill_bytes`](SeededRng::fill_bytes)
+//! (`&self`) can advance the stream, not for cross-thread
 //! synchronization. Holding the lock across a draw is fine — the
 //! critical section is microseconds.
 //!
@@ -32,15 +34,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-/// A seeded PRNG handed to the JS engine and shared across the three
-/// determinism shims.
+/// A seeded PRNG handed to the JS engine as the C-layer random source.
 ///
 /// Internally an [`Arc`]`<`[`Mutex`]`<`[`ChaCha20Rng`]`>>`. Clone is
-/// cheap (bumps the `Arc` refcount) — every JS-side closure that needs
-/// the RNG gets its own clone.
+/// cheap (bumps the `Arc` refcount); the engine boxes one clone into its
+/// `DeterminismHandles` for the runtime's life (see [`crate::ffi`]).
 #[derive(Debug, Clone)]
 pub struct SeededRng {
     inner: Arc<Mutex<ChaCha20Rng>>,
@@ -60,77 +61,21 @@ impl SeededRng {
         }
     }
 
-    /// Draw a uniform `f64` in `[0.0, 1.0)` — the value
-    /// [`Math.random()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Math/random)
-    /// returns.
+    /// Fill `out` with deterministic random bytes — the C random source
+    /// behind the engine's native `Math.random` (`JS_SetRandomSource`;
+    /// see [`crate::ffi`]). After this returns, the slice contains
+    /// `out.len()` bytes drawn from the seeded stream.
     ///
     /// A poisoned mutex (only possible if a panic interrupted a prior
     /// draw — see [`Mutex`] docs; the single-threaded engine makes it
     /// effectively unreachable) is recovered rather than degraded: the
     /// ChaCha20 state is plain data, so the correct deterministic stream
-    /// continues instead of silently collapsing to a stream of `0.0`.
-    pub fn next_f64(&self) -> f64 {
-        // `Rng::gen()` for `f64` returns a uniform value in `[0.0, 1.0)`
-        // — exactly the `Math.random()` contract.
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .gen::<f64>()
-    }
-
-    /// Fill `out` with deterministic random bytes — the workhorse for
-    /// `crypto.getRandomValues(view)`. After this returns, the slice
-    /// contains `out.len()` bytes drawn from the seeded stream.
-    ///
-    /// Recovers a poisoned mutex (same rationale as [`Self::next_f64`])
-    /// so the deterministic stream is preserved rather than no-op'd.
+    /// continues instead of silently collapsing to a stream of zeroes.
     pub fn fill_bytes(&self, out: &mut [u8]) {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .fill_bytes(out);
-    }
-
-    /// Generate a deterministic v4-format UUID string —
-    /// `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx` where `y` is one of
-    /// `8`, `9`, `a`, `b` per [RFC 4122] §4.4.
-    ///
-    /// The output is lowercase hex with the standard 8-4-4-4-12
-    /// dash layout. The version nibble (byte 6 high half) is forced to
-    /// `0100` (= 4); the variant bits (byte 8 high half) are forced to
-    /// `10xx` (RFC 4122).
-    ///
-    /// [RFC 4122]: https://www.rfc-editor.org/rfc/rfc4122#section-4.4
-    pub fn random_uuid(&self) -> String {
-        let mut bytes = [0u8; 16];
-        self.fill_bytes(&mut bytes);
-        // Force version 4 (top nibble of byte 6).
-        bytes[6] = (bytes[6] & 0x0F) | 0x40;
-        // Force variant 10xx (top two bits of byte 8).
-        bytes[8] = (bytes[8] & 0x3F) | 0x80;
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}-\
-             {:02x}{:02x}-\
-             {:02x}{:02x}-\
-             {:02x}{:02x}-\
-             {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3],
-            bytes[4],
-            bytes[5],
-            bytes[6],
-            bytes[7],
-            bytes[8],
-            bytes[9],
-            bytes[10],
-            bytes[11],
-            bytes[12],
-            bytes[13],
-            bytes[14],
-            bytes[15],
-        )
     }
 }
 
@@ -139,84 +84,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_seed_produces_identical_f64_sequence() {
-        // The core determinism guarantee: two fresh RNGs with the
-        // same seed produce byte-identical streams.
-        let a = SeededRng::new(42);
-        let b = SeededRng::new(42);
-        let seq_a: Vec<f64> = (0..5).map(|_| a.next_f64()).collect();
-        let seq_b: Vec<f64> = (0..5).map(|_| b.next_f64()).collect();
-        assert_eq!(
-            seq_a, seq_b,
-            "same seed must produce identical f64 sequence"
-        );
-        // And the values are in the Math.random contract range.
-        for v in &seq_a {
-            assert!(
-                (0.0..1.0).contains(v),
-                "next_f64 should yield [0,1): got {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn different_seed_produces_different_f64_sequence() {
-        // ChaCha20Rng is a quality PRNG — two distinct seeds essentially
-        // never collide on a 5-draw prefix.
-        let a = SeededRng::new(1);
-        let b = SeededRng::new(2);
-        let seq_a: Vec<f64> = (0..5).map(|_| a.next_f64()).collect();
-        let seq_b: Vec<f64> = (0..5).map(|_| b.next_f64()).collect();
-        assert_ne!(
-            seq_a, seq_b,
-            "different seeds should produce different f64 sequences"
-        );
-    }
-
-    #[test]
-    fn random_uuid_is_valid_v4_format() {
-        // Regex-style structural check: lowercase hex, dashes at the
-        // canonical positions, version nibble = 4, variant nibble in
-        // {8,9,a,b}.
-        let rng = SeededRng::new(0);
-        for _ in 0..32 {
-            let s = rng.random_uuid();
-            assert_eq!(
-                s.len(),
-                36,
-                "UUID has 36 chars (32 hex + 4 dashes); got {s:?}"
-            );
-            let bytes = s.as_bytes();
-            assert_eq!(bytes[8], b'-', "dash at idx 8 missing in {s:?}");
-            assert_eq!(bytes[13], b'-', "dash at idx 13 missing in {s:?}");
-            assert_eq!(bytes[18], b'-', "dash at idx 18 missing in {s:?}");
-            assert_eq!(bytes[23], b'-', "dash at idx 23 missing in {s:?}");
-            // Version nibble — the char at idx 14 must be '4'.
-            assert_eq!(bytes[14], b'4', "version nibble must be 4 in {s:?}");
-            // Variant nibble — char at idx 19 must be one of 8/9/a/b.
-            let variant = bytes[19];
-            assert!(
-                matches!(variant, b'8' | b'9' | b'a' | b'b'),
-                "variant nibble must be 8/9/a/b in {s:?} (got {})",
-                variant as char
-            );
-            // Every non-dash char is lowercase hex.
-            for (i, &c) in bytes.iter().enumerate() {
-                if matches!(i, 8 | 13 | 18 | 23) {
-                    continue;
-                }
-                assert!(
-                    c.is_ascii_digit() || (b'a'..=b'f').contains(&c),
-                    "non-lowercase-hex char at idx {i} in {s:?}: {}",
-                    c as char
-                );
-            }
-        }
-    }
-
-    #[test]
     fn fill_bytes_is_deterministic_per_seed() {
         // Same seed → identical bytes; different seeds → different bytes.
+        // This is the guarantee the C `Math.random` source rests on;
+        // engine-level coverage lives in engine.rs `seeded_*` tests.
         let a = SeededRng::new(7);
         let b = SeededRng::new(7);
         let c = SeededRng::new(8);

@@ -1,0 +1,11 @@
+This is a fork of rquickjs-sys 0.11.0 whose vendored quickjs/ tree has been
+replaced with the hesojs determinism-hardened QuickJS-NG fork.
+
+hesojs version : 0.15.0
+hesojs git rev : 399e993d998df53f2e3a5fe418efd2fc47ff67a6
+hesojs describe: 399e993-dirty
+source repo    : ../../hesojs  (sibling checkout at sync time)
+synced files   : dtoa.c libregexp.c libunicode.c quickjs.c + 14 headers
+build.rs delta : removed cutils.c (amalgamated into quickjs.c by hesojs);
+                 added builtin-iterator-zip{,-keyed}.h to header copy list.
+Regenerate with scripts/sync-hesojs.sh (see ADR 0030).

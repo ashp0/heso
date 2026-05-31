@@ -22,27 +22,22 @@ thiserror.workspace = true
 # against the page URL through the shared `reqwest::Client`. See
 # WHATWG HTML §8.1.3 Modules and `src/modules.rs` for the spec map.
 #
-# `disable-assertions` strips QuickJS's debug-only C-level assertions
-# (compiles with `-DNDEBUG`). Without this, two real pages — `https://
-# astro.build/` and `https://vercel.com/` — abort `heso eval-dom` on
-# engine drop with one of two QuickJS assertions:
-#   - `assert(list_empty(&rt->gc_obj_list))` (`quickjs.c:2205`)
-#   - `assert(p->ref_count > 0)` (`quickjs.c:6183` — gc_decref_child)
-# Both shapes are upstream-known: see bellard/quickjs#467 (CVE-
-# 2025-69653, `Iterator.prototype.find` on a DOM-Element-backed array
-# trips an assertion in shutdown GC because QuickJS's mark-decref-
-# sweep can't break the iterator-helper-to-DOM-element cycle when
-# Rust holds the elements via `Class<T>` registrations). With NDEBUG
-# defined, `js_free_rt` proceeds past the failed assert and the
-# runtime memory pool is freed via `rt->mf.js_free(ms->opaque, rt)`
-# in one shot — so the leaked GC objects' memory IS released, just
-# without the per-object book-keeping pass. The minimal repro lives
-# at `crates/heso-engine-js/tests/engine_drop_reproducer.rs`. See
-# the explicit `Drop` impl on [`JsEngine`] for the host-side cleanup
-# that complements this — drains Persistents, microtasks, module
-# state, and forces a final GC so the bypassed assertion is never
-# the only line of defense.
-rquickjs = { version = "0.11", features = ["classes", "properties", "macro", "loader", "disable-assertions"] }
+# The engine is the in-tree hesojs determinism fork, wired via
+# `[patch.crates-io] rquickjs-sys` at the workspace root (ADR 0030).
+# Two feature changes vs stock rquickjs:
+#
+# `bindgen` regenerates the FFI bindings from the hesojs `quickjs.h`
+# at build time (instead of rquickjs-sys's pre-shipped per-target
+# bindings, which predate hesojs and lack the determinism setters).
+# This is what makes `JS_SetClockSource` / `JS_SetRandomSource` /
+# `JS_SetRuntimeTimezone` / `JS_FreeRuntimeForce` callable from
+# `src/ffi.rs`. Requires libclang on the build host (Xcode CLT or
+# `brew install llvm`); CI documents `LIBCLANG_PATH`.
+#
+# Note: stock rquickjs's `disable-assertions` is intentionally NOT
+# enabled — heso ships with C asserts ON now that hesojs fixes the
+# shutdown-GC cycle at the engine layer (ADR 0030; bellard/quickjs#467).
+rquickjs = { version = "0.11", features = ["classes", "properties", "macro", "loader", "bindgen"] }
 # heso-engine-fetch supplies the protocol-level fetch + action graph
 # we'll wire DOM access against once mutations + events land.
 heso-engine-fetch = { path = "../heso-engine-fetch" }
@@ -55,13 +50,13 @@ heso-engine-fetch = { path = "../heso-engine-fetch" }
 # 0.28.0 (the only 0.28.x at time of writing). Bumping is a deliberate
 # act, not an automatic minor lift. See ADR 0014.
 dom_query = "=0.28.0"
-# Phase 2 determinism shims (per ADR 0008): seed a single ChaCha20 PRNG
-# from the session's `--seed N` value and route `Math.random`,
-# `crypto.getRandomValues`, and `crypto.randomUUID` through it so two
-# runs of the same script with the same seed produce byte-identical
-# observable output. `rand_chacha::ChaCha20Rng` is portable across
-# platforms and library versions (unlike `StdRng`), which is the
-# property we actually need. See `src/rng.rs`.
+# Determinism (per ADR 0008): seed a single ChaCha20 PRNG from the
+# session's `--seed N` value. It feeds the engine's native `Math.random`
+# via the C `JS_SetRandomSource` hook (ADR 0030); `crypto` is a pure-JS
+# shim over that `Math.random`. Same seed + same engine → byte-identical
+# output. `rand_chacha::ChaCha20Rng` is portable across platforms and
+# library versions (unlike `StdRng`), the property we actually need.
+# See `src/rng.rs` and `src/ffi.rs`.
 rand = "0.8"
 rand_chacha = "0.3"
 # Phase 1C item C: `fetch()` inside JS. Shares the workspace
@@ -105,6 +100,11 @@ regex.workspace = true
 wiremock = "0.6"
 tokio = { workspace = true }
 
+# `deny`, not `forbid`: this is the sanctioned C-FFI exception
+# (`.agent/CONVENTIONS.md`). All `unsafe` is confined to `src/ffi.rs`
+# (the hesojs determinism boundary, ADR 0030), which opts in with a
+# module-scoped `#![allow(unsafe_code)]`; `forbid` would make that a hard
+# error. Every other module stays denied.
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"
