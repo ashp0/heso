@@ -21,7 +21,6 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "QuickJS bindings for rquickjs"
-readme = "README.md"
 keywords = [
     "quickjs",
     "ecmascript",

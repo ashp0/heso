@@ -48,6 +48,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Manual re-publish for an existing tag — e.g. after fixing a build job
+  # that blocked the tag-triggered run. Runs from the dispatched branch;
+  # pass the version like "0.3.0".
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. "0.3.0" (defaults to the pushed tag on a tag event).'
+        required: true
+        type: string
 
 # Cancel any in-progress publish for the same tag (e.g. a re-pushed
 # tag) so we don't race with ourselves. Different tags get separate
@@ -58,6 +67,12 @@ concurrency:
 
 permissions:
   contents: read
+
+# Resolved once: the dispatch input on a manual re-publish, else the pushed
+# tag. Consumers strip the leading "v". Passed through `env` (never inlined
+# into a run: script) so the input can't be used for command injection.
+env:
+  REL_VERSION: ${{ github.event.inputs.version || github.ref_name }}
 
 jobs:
   # ----------------------------------------------------------------------
@@ -81,14 +96,18 @@ jobs:
             plat-tag: manylinux_2_17_x86_64
             binary: heso
             cross: false
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            # PEP 600 manylinux_2_17 aarch64 == manylinux2014_aarch64.
-            # 2.17 is the glibc on CentOS 7 / RHEL 7 — broadest reach
-            # without going to musllinux.
+            # Built natively on a GitHub-hosted arm64 runner (free on public
+            # repos). The old `cross` Docker image shipped libclang 3.8 — too
+            # old for the bindgen step the hesojs engine added (ADR 0030); it
+            # aborted with `clang_getTranslationUnitTargetInfo` unsupported.
+            # Native uses the runner's modern libclang, exactly like the
+            # x86_64-linux job. Tag stays manylinux_2_17_aarch64 to match the
+            # x86_64 wheel's tagging convention.
             plat-tag: manylinux_2_17_aarch64
             binary: heso
-            cross: true
+            cross: false
           - runner: macos-latest
             target: x86_64-apple-darwin
             plat-tag: macosx_11_0_x86_64
@@ -142,7 +161,7 @@ jobs:
 
       - name: Set Python package __version__ from tag
         run: |
-          export VERSION="${GITHUB_REF_NAME#v}"
+          export VERSION="${REL_VERSION#v}"
           python - <<'PY'
           import os
           import re
@@ -231,11 +250,11 @@ jobs:
             npm-plat: linux-x64
             binary: heso
             cross: false
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             npm-plat: linux-arm64
             binary: heso
-            cross: true
+            cross: false
           - runner: macos-latest
             target: x86_64-apple-darwin
             npm-plat: darwin-x64
@@ -288,7 +307,7 @@ jobs:
       # agree). The tag is `v0.0.2` -> version is `0.0.2`.
       - name: Set platform package version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION#v}"
           echo "Setting @ixla/heso-${{ matrix.npm-plat }} version to $VERSION"
           node -e "
             const fs = require('fs');
@@ -299,7 +318,7 @@ jobs:
           "
           cat npm/platforms/${{ matrix.npm-plat }}/package.json
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.REL_VERSION }}
         shell: bash
 
       # Tar the platform package directory so we can hand it whole to
@@ -495,7 +514,7 @@ jobs:
       # main at 0.0.1 between releases).
       - name: Set meta package version
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.REL_VERSION }}
         run: |
           VERSION="${VERSION#v}"
           echo "Pinning meta package + optionalDependencies to $VERSION"
