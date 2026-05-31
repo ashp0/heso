@@ -216,8 +216,11 @@ export interface WriteVerbResult {
 
 /**
  * `heso search <query>` — web search across an always-on rotating pool
- * (Mojeek, Brave, Marginalia, the two DuckDuckGo endpoints) plus a
- * Wikipedia knowledge block, and SearXNG via `searxUrl`. No API key.
+ * (Mojeek, Brave, Marginalia, plus a Wikipedia knowledge block; SearXNG
+ * joins the pool only when a base URL is configured via `searxUrl`). The
+ * two DuckDuckGo endpoints (`ddg`, `ddg-lite`) are NOT default engines —
+ * they are opt-in via `--engines ddg,ddg-lite` (they 202/403-throttle
+ * scripted callers per IP). No API key.
  * Resolves with `{ query, engines_used, blocked, results, knowledge,
  * errors }`. A throttled backend is surfaced in `blocked` (and a typed
  * `errors[]` row whose `code` is `"rate_limited" | "bot_challenge" |
@@ -292,6 +295,8 @@ export function submit(url: string, options: SubmitOptions): Promise<WriteVerbRe
 export function evalJs(
   js: string,
   options?: CommonOptions & {
+    /** Pins the engine clock + RNG (C-layer determinism, ADR 0030) that back `Math.random`, `crypto.getRandomValues`, and timers. */
+    seed?: number;
     /** Cap JS wall-clock; forwarded as `--js-timeout`. Default: no cap. */
     jsTimeout?: string | number;
   },
@@ -352,7 +357,7 @@ export function tree(url: string, options?: CommonOptions): Promise<Record<strin
  * `run`, which mint a plat; `replay` and `refresh` ignore them.
  */
 export interface PlanOptions extends CommonOptions, ProducerSignOptions {
-  /** Seeds determinism shims (`Math.random`, `crypto.getRandomValues`, timers). */
+  /** Pins the engine clock + RNG (C-layer determinism, ADR 0030) that back `Math.random`, `crypto.getRandomValues`, and timers. */
   seed?: number;
   /** `replay` only: return the plan field instead of the per-step log. */
   plan?: boolean;

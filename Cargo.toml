@@ -26,7 +26,7 @@ exclude = ["crates/heso-quickjs-sys"]
 rquickjs-sys = { path = "crates/heso-quickjs-sys" }
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"

@@ -53,7 +53,7 @@ function _checkBinaryVersion(binaryPath) {
     return;
   }
   if (!out || out.status !== 0 || !out.stdout) return;
-  // Banner shape: "heso 0.1.4". Second token is the version.
+  // Banner shape: "heso 0.3.0". Second token is the version.
   const firstLine = out.stdout.split("\n", 1)[0] || "";
   const parts = firstLine.trim().split(/\s+/);
   if (parts.length < 2) return;
@@ -432,8 +432,11 @@ function wait(url, options) {
 
 /**
  * `heso search <query>` — web search across an always-on rotating pool
- * (Mojeek, Brave, Marginalia, the two DuckDuckGo endpoints) plus a
- * Wikipedia knowledge block, and SearXNG via `searxUrl`. No API key.
+ * (Mojeek, Brave, Marginalia) plus a Wikipedia knowledge block, and
+ * SearXNG only when a base URL is configured via `searxUrl`. No API key.
+ * The two DuckDuckGo endpoints (`ddg`, `ddg-lite`) are opt-in via
+ * `engines: "ddg,ddg-lite"` — they 202/403-throttle scripted callers per
+ * IP and are NOT part of the default pool.
  * Resolves with `{ query, engines_used, blocked, results, knowledge,
  * errors }`:
  *   - `results`: a list of `{ rank, title, url, snippet, source }` rows.
@@ -449,8 +452,9 @@ function wait(url, options) {
  *     "config_error" | "transport_error"`.
  *
  * Common options: `limit` (default 30, max 100), `engines`
- * ("mojeek,brave,marginalia,ddg,ddg-lite,wiki" by default, or any
- * subset), `searxUrl` (also reads `HESO_SEARX_URL`), `timeout` (per-
+ * ("mojeek,brave,marginalia,wiki" by default; supported opt-in values
+ * also include `ddg` and `ddg-lite`), `searxUrl` (also reads
+ * `HESO_SEARX_URL`), `timeout` (per-
  * backend request budget in ms; the always-on retry layer may spend it
  * up to 4x per backend).
  */

@@ -195,7 +195,7 @@ def _check_binary_version(binary_path: str) -> None:
     line = (proc.stdout or "").strip().splitlines()[0:1]
     if not line:
         return
-    # Banner shape: "heso 0.1.4". Take the second whitespace-split token.
+    # Banner shape: "heso 0.3.0". Take the second whitespace-split token.
     parts = line[0].split()
     if len(parts) < 2:
         return
@@ -528,8 +528,11 @@ def wait(url: str, **kwargs: Any) -> dict:
 
 def search(query: str, **kwargs: Any) -> dict:
     """``heso search <query>`` — web search across an always-on rotating
-    pool (Mojeek, Brave, Marginalia, the two DuckDuckGo endpoints) plus a
-    Wikipedia knowledge block, and SearXNG when configured. No API key.
+    pool (Mojeek, Brave, Marginalia) plus a Wikipedia knowledge block,
+    and SearXNG only when a base URL is configured. No API key. The two
+    DuckDuckGo endpoints (``ddg``, ``ddg-lite``) are opt-in via
+    ``--engines ddg,ddg-lite`` — they 202/403-throttle scripted callers
+    per IP and are NOT in the default pool.
 
     Returns ``{query, engines_used, blocked, results, knowledge, errors}``
     as a dict:
@@ -549,7 +552,8 @@ def search(query: str, **kwargs: Any) -> dict:
         limit: int — cap on results (default 30, max 100).
         engines: str — comma-separated subset of
             ``mojeek,brave,marginalia,ddg,ddg-lite,searxng,wiki`` (default
-            ``mojeek,brave,marginalia,ddg,ddg-lite,wiki``).
+            ``mojeek,brave,marginalia,wiki``; ``ddg``/``ddg-lite`` are
+            opt-in).
         searx_url: str — base URL for a SearXNG instance. Also reads
             ``HESO_SEARX_URL`` from the environment.
         timeout: float — per-backend request budget in seconds; the
@@ -672,8 +676,10 @@ def submit(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
 def eval_js(js: str, **kwargs: Any) -> dict:
     """``heso eval-js <js>`` — evaluate JS in a sandboxed QuickJS context.
 
-    Returns ``{value, console, ...}``. ``seed=N`` seeds the
-    determinism shims. ``js_timeout="5s"`` caps script wall-clock and
+    Returns ``{value, console, ...}``. ``seed=N`` pins the engine clock
+    + RNG (C-layer determinism, ADR 0030) that back ``Math.random``,
+    ``crypto.getRandomValues``, and timers. ``js_timeout="5s"`` caps
+    script wall-clock and
     returns a structured ``timeout`` error on expiry (default: no cap).
     No DOM — use :func:`eval_dom` for that.
     """
@@ -688,7 +694,9 @@ def eval_dom(url: str, js: str, **kwargs: Any) -> dict:
     Returns ``{ok, url, value, console, ...}``.
 
     Common kwargs:
-        seed: int — RNG seed (default 0).
+        seed: int — pins the engine clock + RNG (C-layer determinism,
+            ADR 0030) that back ``Math.random``,
+            ``crypto.getRandomValues``, and timers (default 0).
         js_fetch: bool — install the JS fetch() global.
         js_timeout: str — cap script wall-clock (e.g. "5s"); returns a
             structured timeout error on expiry (default: no cap).
@@ -799,6 +807,9 @@ def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
     The minted plat is signed inline by default (``sig`` + ``lineage``
     in the output).
 
+    ``plat_hash`` is engine-version-specific; a plat stamped on an older
+    engine must be re-stamped.
+
     Common kwargs:
         seed: int — RNG seed (default 0).
         template: str — load a v0 plan template from disk.
@@ -841,6 +852,9 @@ def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
     emits the recorded step log, and :func:`stamp` to mint a plat
     against the live web.
 
+    ``plat_hash`` is engine-version-specific; a plat stamped on an older
+    engine must be re-stamped.
+
     Named ``run_plat`` to avoid shadowing the low-level :func:`run`
     escape hatch.
 
@@ -873,6 +887,9 @@ def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
 
     Accepts ``timeout=N`` (seconds, default 30) capping each per-step
     HTTP request the re-stamp makes.
+
+    ``plat_hash`` is engine-version-specific; a plat stamped on an older
+    engine must be re-stamped.
     """
     spawn, cli = _split_spawn_opts(kwargs)
     try:
@@ -1203,4 +1220,4 @@ def session(binary: Optional[str] = None) -> Session:
 # Kept in sync at release time by `.github/workflows/pypi.yml` (its
 # "Set Python package __version__ from tag" step rewrites this line).
 # The value here is the same default the workspace ships with.
-__version__ = "0.2.2"
+__version__ = "0.3.0"

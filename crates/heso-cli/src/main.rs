@@ -59,8 +59,9 @@
 //!   call. Useful for handing the agent a static map of a small subset of
 //!   the site in one round-trip.
 //! - `heso search <query>` — First-class multi-source web search verb.
-//!   DDG HTML + Wikipedia REST summary by default (no API keys);
-//!   optional SearXNG via `--searx-url` or `HESO_SEARX_URL`. Pure HTTP
+//!   Mojeek + Brave + Marginalia + Wikipedia REST summary by default (no
+//!   API keys), with DuckDuckGo opt-in; optional SearXNG via `--searx-url`
+//!   or `HESO_SEARX_URL`. Pure HTTP
 //!   plus HTML parsing — no JS engine. Round-robin ranked merge
 //!   across engines, dedupe by canonical URL. Wikipedia goes in
 //!   the top-level `knowledge` block, not in `results`. See
@@ -305,9 +306,9 @@ fn print_banner() {
     println!("  heso cat   <url> <path|@ref>  Fetch + read intro text at <path>, or the element at <@ref>");
     println!("  heso find  <url> [--role X] [--name SUBSTR] [--section /p]   List interactive elements (action graph)");
     println!("  heso meta  <url>              Fetch + extract metadata (JSON-LD, OpenGraph, SEO meta) as JSON");
-    println!("  heso search <query>           Web search across Mojeek, DuckDuckGo, and Wikipedia. No API key.");
+    println!("  heso search <query>           Web search across Mojeek, Brave, Marginalia, and Wikipedia (DuckDuckGo opt-in). No API key.");
     println!("    [--limit N]                    Cap on results (default 30, max 100).");
-    println!("    [--engines ddg,mojeek,wiki,searxng]  Which engines to query (default ddg,mojeek,wiki).");
+    println!("    [--engines mojeek,brave,marginalia,ddg,ddg-lite,searxng,wiki]  Which engines to query (default mojeek,brave,marginalia,wiki; ddg/ddg-lite are opt-in).");
     println!("    [--searx-url URL]              Use a SearXNG instance (or set HESO_SEARX_URL).");
     println!("  heso open  <url>              Fetch once, return {{url,title,description,metadata,tree,actions,plat_hash}} (agent-facing)");
     println!("    [--explore-links N]            Pre-fetch up to --link-cap direct (depth=1) or nested (depth>=2) same-origin links");
@@ -370,7 +371,8 @@ fn print_banner() {
     println!("  heso eval-dom [--seed N] [--js-fetch] [--js-timeout DUR] <url> <js>");
     println!("                                Fetch <url>, run every <script> in document order, then eval <js>");
     println!("                                against the post-hydration DOM. Pass `-` for <js> to read from stdin.");
-    println!("                                --seed N seeds the determinism shims (default 0). Default skips <script src=...>;");
+    println!("                                --seed N pins the engine clock + RNG (C-layer determinism, ADR 0030) that back");
+    println!("                                Math.random, crypto.getRandomValues, and timers (default 0). Default skips <script src=...>;");
     println!("                                pass --js-fetch to install the JS `fetch()` global and honor <script src=...>");
     println!("                                via the same `reqwest::Client` used for the page load (cookies + receipts coherent).");
     println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error.");
@@ -413,6 +415,10 @@ fn print_banner() {
     println!("                                and runs the right check. Exit codes follow the per-type");
     println!("                                conventions of the dedicated verbs.");
     println!("    [--trusted-keys PATH]          JSON file of allowlisted base64 pubkeys (also reads HESO_TRUSTED_KEYS env)");
+    println!("    [--expect-signer FP]           Require the signer fingerprint to equal FP (pin a known signer)");
+    println!("    [--signer-key PATH]            Pin the expected signer to the public key at PATH");
+    println!("    [--known-signers PATH]         TOFU store of trusted signer fingerprints (path)");
+    println!("    [--accept-new-signer]          On first sight, record the signer into --known-signers (TOFU)");
     println!("    [--require-tsa]                Reject receipts/sealed plats without a valid TSA timestamp");
     println!("    [--tsa-trusted-roots PATH]     PEM bundle of trusted timestamp-authority roots");
     println!("  heso info <file> [<file2>]    Human summary of a single artifact, or a diff between two");

@@ -37,7 +37,7 @@ specified on the canonical spec page.
 | `eval-dom` | Fetch a URL, run its scripts, then evaluate JS against the post-hydration DOM. |
 | `wait` | Block until a page condition is satisfied. |
 | `batch` | Run many URLs in parallel under one cookie jar. |
-| `search` | Multi-backend web search across Mojeek, DuckDuckGo, and Wikipedia (optional SearXNG); no API key. |
+| `search` | Multi-backend web search across Mojeek, Brave, Marginalia, and Wikipedia (optional SearXNG; DuckDuckGo opt-in via --engines ddg,ddg-lite); no API key. |
 | `serve` | Long-running JSON-RPC 2.0 server over stdin/stdout. |
 | `identity` | Generate or inspect an Ed25519 signing identity. |
 

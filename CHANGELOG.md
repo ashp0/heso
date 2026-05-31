@@ -4,7 +4,7 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-05-31
 
 ### Changed
 
@@ -16,6 +16,20 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Math.random` / `performance.now` closures, and the process-global
   `TZ=UTC` pin). `crypto` is now a pure-JS shim over the seeded engine
   RNG rather than a Rust closure.
+- `heso search` no longer queries the DuckDuckGo endpoints by default —
+  they `202`/`403`-throttle scripted callers per IP and only added a
+  `blocked` row from a normal egress IP. They remain available opt-in
+  via `--engines ddg,ddg-lite`. The default pool is now Mojeek + Brave +
+  Marginalia + Wikipedia (plus SearXNG when `--searx-url` is set).
+- Repository and homepage links updated to `github.com/heso-inc/heso`
+  across the Cargo, npm, and PyPI package metadata, the CLI banner, and
+  the docs.
+
+### Added
+
+- The README publishes measured macOS arm64 release-binary stats
+  (binary size, cold-start latency over the network, and engine-only
+  latency).
 
 ### Removed
 
@@ -35,7 +49,27 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > Native `Date.toString()` and `Math.random` produce different bytes
 > than the old JS shims (determinism still holds: same seed + same
 > engine version → identical bytes). Re-stamp cassettes recorded
-> against the old engine.
+> against the old engine. Plats over static content (no date/RNG) are
+> unaffected and replay byte-identically across the swap.
+
+## [0.2.2] - 2026-05-29
+
+### Changed
+
+- Scoped the plat performance claims in the docs to what they
+  demonstrably prove, and removed the competitor comparison table.
+
+## [0.2.1] - 2026-05-29
+
+### Added
+
+- Read and interact against the hydrated (post-script) DOM, and wrapped
+  the new CLI flags in the npm and Python libraries with documentation
+  for the new capabilities.
+
+### Changed
+
+- Phrased the bare-plat contract in present tense.
 
 ## [0.2.0] - 2026-05-28
 

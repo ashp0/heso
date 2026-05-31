@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/heso-inc/heso/rele
 ```
 
 <!-- heso:version:start -->
-> Shipping `v0.2.2` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.3.0` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 <!-- heso:version:end -->
 
 After install, `heso` is on `$PATH`:
@@ -74,7 +74,7 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 
 **Find and read things.**
 
-- `heso search "<query>"` — searches the web (Mojeek + DuckDuckGo + Wikipedia, optional SearXNG). No API key. Rotates across the backends with backoff so it isn't silently rate-limited; a throttled backend is reported loudly (a `blocked` list + typed `errors[].code`) while partial results still come back from the rest. Never a silent empty. `--timeout` supported.
+- `heso search "<query>"` — searches the web (Mojeek + Brave + Marginalia + Wikipedia, optional SearXNG; DuckDuckGo opt-in via --engines ddg,ddg-lite). No API key. Rotates across the backends with backoff so it isn't silently rate-limited; a throttled backend is reported loudly (a `blocked` list + typed `errors[].code`) while partial results still come back from the rest. Never a silent empty. `--timeout` supported.
 - `heso open <url>` — fetches and returns a page summary: title, headings, actionable elements.
 - `heso read <url>` — fetches, runs JS, returns the full picture: title, visible text, actions, forms, cookies, console output, framework detection. One call.
 - `heso read <url> --complete` — same, but heso loops "fire pending observers + click load-more + wait for DOM to settle" until the page stops changing. For lazy-loaded sites.
@@ -257,8 +257,8 @@ heso serve
 Reproducibility (same seed → same output across machines):
 
 ```sh
-heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
-heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
+heso eval-js --seed 42 'Math.random()'   # 0.514049295765024
+heso eval-js --seed 42 'Math.random()'   # 0.514049295765024
 ```
 
 ## Tamper-evidence
@@ -423,7 +423,7 @@ No registration server, no central authority. **Dispatch is local-only** (spec �
 
 DNS ownership prevents anyone but you from claiming names *under your domain* — same anti-impersonation model as Java packages, Android application IDs, Maven groups, and OCI image labels. It does NOT solve typosquatting (`com.exarnple.foo` and `com.example.foo` are distinct names that look identical to a human reader). HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `verify --trusted-keys` allowlist (spec §3.9, §4.6).
 
-Today, the reference implementation (this binary, `v0.2.2`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
+Today, the reference implementation (this binary, `v0.3.0`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
 
 ## Use as an agent skill
 
@@ -437,7 +437,7 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 
 ## Verbs
 
-- `heso search "<query>" [--limit N]` — web search via Mojeek + DDG + Wikipedia
+- `heso search "<query>" [--limit N]` — web search via Mojeek + Brave + Marginalia + Wikipedia (DuckDuckGo opt-in)
 - `heso open <url>` — page summary
 - `heso read <url> [--complete]` — full content + actions + forms (use --complete for lazy-loaded sites)
 - `heso wait <url> --selector-exists ".x"` — block until a condition is true
@@ -508,7 +508,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-`v0.2.2` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the full test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
+`v0.3.0` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the full test suite is required green on every release. This upcoming release moves the JS engine to the in-tree hesojs determinism fork (ADR 0030): `Date`/RNG bytes shift for a given seed, so `plat_hash` values change and plats stamped on the previous engine must be re-stamped. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 
