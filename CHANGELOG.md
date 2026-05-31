@@ -44,6 +44,11 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `eval-dom` no longer aborts tearing down the runtime on pages that
   exercise the iterator-helper shutdown-GC cycle (e.g. astro.build,
   vercel.com).
+- First-run signing-identity creation is now atomic: the 32-byte key is
+  written to a temp file and hard-linked into place, so concurrent `heso`
+  invocations on a fresh machine can no longer observe a half-written key
+  and fail with `identity key file ... has wrong length: expected 32,
+  got 0`.
 
 > **Note:** `plat_hash` shifts for pages that read the date or RNG.
 > Native `Date.toString()` and `Math.random` produce different bytes

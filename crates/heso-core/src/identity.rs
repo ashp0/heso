@@ -159,55 +159,76 @@ impl IdentityKey {
     /// needed. Refuses to overwrite an existing file — callers should
     /// delete first if rotation is intended.
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| IdentityError::Io {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-            }
-        }
-        // `create_new` is O_EXCL / CREATE_NEW: the existence check and the
-        // create are one atomic syscall, so two first-run processes racing
-        // to write the same key cannot both succeed. The loser gets
-        // `AlreadyExists`, which `load_or_create` maps to a re-load of the
-        // winner's key — both end up on the same identity.
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(IdentityError::AlreadyExists(path.to_path_buf()));
-            }
-            Err(e) => {
-                return Err(IdentityError::Io {
-                    path: path.to_path_buf(),
-                    source: e,
-                });
-            }
-        };
-        {
-            use std::io::Write as _;
-            file.write_all(&self.signing.to_bytes()).map_err(|e| IdentityError::Io {
-                path: path.to_path_buf(),
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            fs::create_dir_all(parent).map_err(|e| IdentityError::Io {
+                path: parent.to_path_buf(),
                 source: e,
             })?;
         }
-        // Close the handle before hardening so the Windows `icacls` path
-        // operates on a settled file.
-        drop(file);
-        // A failed hardening must leave no artifact behind: the partial key
-        // would otherwise sit on disk with the parent's broad ACL, and the
-        // `create_new` open above would block the caller from retrying.
-        // Delete it before surfacing the error so a failed `save` is both
-        // loud and retryable.
-        if let Err(e) = Self::harden_permissions(path) {
-            let _ = fs::remove_file(path);
+
+        // Write the full 32-byte key to a unique temp file in the same
+        // directory, harden it, THEN atomically link it into place.
+        //
+        // The old approach — `create_new(path)` then a separate `write_all`
+        // — left a window where `path` existed but was still 0 bytes, so a
+        // concurrent first-run `load()` could read the empty file and fail
+        // with `BadKeyLength { actual: 0 }` (which `load_or_create` does not
+        // retry). Linking a fully-written inode means `path` is only ever
+        // observed absent or complete, never partial. `hard_link` is itself
+        // exclusive-create (it fails `AlreadyExists` if `path` is taken), so
+        // the no-overwrite + race-loser-reloads contract `load_or_create`
+        // relies on is preserved. Hardening the temp inode first means the
+        // permissions/ACL are already tight the instant `path` appears.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("identity.key");
+        let tmp_name = format!(".{file_name}.tmp.{}.{n}", std::process::id());
+        let tmp = match parent {
+            Some(p) => p.join(tmp_name),
+            None => PathBuf::from(tmp_name),
+        };
+
+        let write_result = (|| -> Result<(), IdentityError> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| IdentityError::Io {
+                    path: tmp.clone(),
+                    source: e,
+                })?;
+            file.write_all(&self.signing.to_bytes())
+                .map_err(|e| IdentityError::Io {
+                    path: tmp.clone(),
+                    source: e,
+                })?;
+            Ok(())
+        })();
+        if let Err(e) = write_result.and_then(|()| Self::harden_permissions(&tmp)) {
+            let _ = fs::remove_file(&tmp);
             return Err(e);
         }
-        Ok(())
+
+        // Atomic, exclusive publish: fails if `path` already exists.
+        let published = match fs::hard_link(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(IdentityError::AlreadyExists(path.to_path_buf()))
+            }
+            Err(e) => Err(IdentityError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }),
+        };
+        // The temp link has served its purpose either way; `path` (on
+        // success) keeps the inode alive.
+        let _ = fs::remove_file(&tmp);
+        published
     }
 
     /// Restrict the key file to the current user. On Unix that's a

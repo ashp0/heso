@@ -26,12 +26,15 @@ fn heso_bin() -> PathBuf {
 }
 
 fn write_temp(suffix: &str, body: &[u8]) -> PathBuf {
+    // Unique per call: a process-global counter plus the pid. The old
+    // `SystemTime::now().as_nanos()` collided when two concurrent tests
+    // landed in the same clock tick and shared `suffix` ("plan.json"), so
+    // one test's `heso stamp` read the other's plan and fetched a different
+    // wiremock port — an intermittent `left == right` failure.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    p.push(format!("heso-cassette-{unique}-{suffix}"));
+    p.push(format!("heso-cassette-{}-{n}-{suffix}", std::process::id()));
     std::fs::write(&p, body).expect("write temp");
     p
 }
