@@ -593,7 +593,7 @@ fn detect_update_steps() -> Vec<UpdateStep> {
         steps.push(UpdateStep {
             channel: "cargo",
             command:
-                "cargo install --git https://github.com/blank3rs/heso heso-cli --locked --force",
+                "cargo install --git https://github.com/heso-inc/heso heso-cli --locked --force",
         });
     }
 
@@ -636,11 +636,11 @@ async fn cmd_update(args: &[String]) -> ExitCode {
         );
         if cfg!(windows) {
             println!(
-                "  powershell -ExecutionPolicy Bypass -c \"irm https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.ps1 | iex\""
+                "  powershell -ExecutionPolicy Bypass -c \"irm https://github.com/heso-inc/heso/releases/latest/download/heso-cli-installer.ps1 | iex\""
             );
         } else {
             println!(
-                "  curl --proto '=https' --tlsv1.2 -LsSf https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.sh | sh"
+                "  curl --proto '=https' --tlsv1.2 -LsSf https://github.com/heso-inc/heso/releases/latest/download/heso-cli-installer.sh | sh"
             );
         }
         return ExitCode::SUCCESS;

@@ -155,7 +155,7 @@ def _find_binary() -> str:
         "heso binary not found. Looked for a bundled copy at "
         f"{bundled} and for `heso` on PATH. Reinstall the package "
         "or download a release binary from "
-        "https://github.com/blank3rs/heso/releases."
+        "https://github.com/heso-inc/heso/releases."
     )
 
 

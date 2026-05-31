@@ -6,10 +6,10 @@
   "homepage": "https://www.heso.ca",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/blank3rs/heso.git"
+    "url": "git+https://github.com/heso-inc/heso.git"
   },
   "bugs": {
-    "url": "https://github.com/blank3rs/heso/issues"
+    "url": "https://github.com/heso-inc/heso/issues"
   },
   "keywords": [
     "headless-browser",

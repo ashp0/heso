@@ -19,7 +19,7 @@ version = "0.2.2"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/blank3rs/heso"
+repository = "https://github.com/heso-inc/heso"
 homepage = "https://www.heso.ca"
 authors = ["Akshay and heso contributors"]
 

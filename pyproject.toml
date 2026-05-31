@@ -58,8 +58,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://www.heso.ca"
 Documentation = "https://www.heso.ca/docs"
-Repository = "https://github.com/blank3rs/heso"
-Issues = "https://github.com/blank3rs/heso/issues"
+Repository = "https://github.com/heso-inc/heso"
+Issues = "https://github.com/heso-inc/heso/issues"
 
 # The `heso` command on PATH is the native binary itself, shipped via
 # setup.py's `scripts` entry into the wheel's `*.data/scripts/`

@@ -255,4 +255,4 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   removed (the second occurrence was unreachable).
 
 Releases prior to this changelog are documented at
-<https://github.com/blank3rs/heso/releases>.
+<https://github.com/heso-inc/heso/releases>.

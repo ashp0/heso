@@ -337,7 +337,7 @@ jobs:
   #        on OIDC configuration
   #
   #    To use Trusted Publishers, on the PyPI project settings page add:
-  #      owner: blank3rs
+  #      owner: heso-inc
   #      repo: heso
   #      workflow filename: pypi.yml
   #      environment name: pypi

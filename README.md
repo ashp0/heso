@@ -1,6 +1,6 @@
 # heso — the auditable layer for the agent web.
 
-**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
+**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/heso-inc/heso/releases)**
 
 A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of the run.
 
@@ -10,14 +10,14 @@ Capabilities return JSON. Failures come back as structured data (`partial: true`
 
 <!-- heso:perf:start -->
 ```
-binary       10.44 MB
-cold start   ~77 ms   (open https://example.com, network included)
-engine only  ~28 ms   (no network)
-batch        ~1.1 s   for 8 URLs in parallel
+binary       8.96 MB
+cold start   ~120 ms  (open https://example.com, network included)
+engine only  ~11 ms   (no network)
+batch        ~1.3 s   for 8 URLs in parallel
 ```
 <!-- heso:perf:end -->
 
-[![heso agent demo — 50 second screen recording](https://raw.githubusercontent.com/blank3rs/heso/main/demo/poster.jpg)](https://www.heso.ca/#demo)
+[![heso agent demo — 50 second screen recording](https://raw.githubusercontent.com/heso-inc/heso/main/demo/poster.jpg)](https://www.heso.ca/#demo)
 
 A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a signed, verifiable plat. No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
 
@@ -51,10 +51,10 @@ npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example
 
 # Direct binary installers
 # macOS / Linux:
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/heso-inc/heso/releases/latest/download/heso-cli-installer.sh | sh
 
 # Windows:
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/heso-inc/heso/releases/latest/download/heso-cli-installer.ps1 | iex"
 ```
 
 <!-- heso:version:start -->
@@ -135,7 +135,7 @@ heso unseal sealed.plat --extract          # verify, then print the inner plat b
 **Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
 
 ```sh
-curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
+curl -sL https://github.com/heso-inc/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
   | heso run - \
   | jq -r .plat_hash
 # → cff9a46a9dbe3163e5c00597f8d46255682e3efe52af3dbc2a628a49374a9acb
@@ -143,7 +143,7 @@ curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-
 
 That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia `Goldfinger (film)` article. No network is involved in `heso run` itself.
 
-The sample plat ([`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json), ~1 MB) lives as a release asset, re-minted by the current `heso`. A plat replays byte-identically under the version that produced it — pin the version if you archive one.
+The sample plat ([`replay-demo-1-goldfinger.plat.json`](https://github.com/heso-inc/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json), ~1 MB) lives as a release asset, re-minted by the current `heso`. A plat replays byte-identically under the version that produced it — pin the version if you archive one.
 
 **Recover from broken sites.**
 
@@ -483,22 +483,22 @@ The budget is per network request — it applies to the full request (TLS handsh
 
 ## Stats
 
-Measured on Windows 11, AMD x86_64, with the release binary:
+Measured on macOS (Apple arm64), with the release binary:
 
 | Thing | Number |
 |---|---|
-| Binary size | 10.44 MB |
-| Cold start (`open https://example.com`, network included) | ~77 ms |
-| Engine-only (no network, local fixture) | ~28 ms |
-| Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
-| Search (5 results) | ~1.5 s |
+| Binary size | 8.96 MB |
+| Cold start (`open https://example.com`, network included) | ~120 ms |
+| Engine-only (no network, local fixture) | ~11 ms |
+| Batch (8 URLs, `--parallel 8`) | ~1.3 s total |
+| Search (5 results) | ~1.4 s |
 
 ## Building from source
 
 If you want to hack on heso itself (prebuilt binaries for Windows x64, Linux x64+arm64, macOS x64+arm64 ship from each release tag — see Install above):
 
 ```sh
-git clone https://github.com/blank3rs/heso
+git clone https://github.com/heso-inc/heso
 cd heso
 cargo build --release -p heso-cli
 ./target/release/heso search "rust web scraping" --limit 5

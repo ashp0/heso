@@ -93,8 +93,8 @@ function main() {
     process.stderr.write(
       `heso: no prebuilt binary for ${resolved.key}.\n` +
         `Supported: win32-x64, linux-x64, linux-arm64, darwin-x64, darwin-arm64.\n` +
-        `Track other-platform progress at https://github.com/blank3rs/heso/releases\n` +
-        `or build from source: cargo install --git https://github.com/blank3rs/heso heso-cli\n`,
+        `Track other-platform progress at https://github.com/heso-inc/heso/releases\n` +
+        `or build from source: cargo install --git https://github.com/heso-inc/heso heso-cli\n`,
     );
     process.exit(1);
   }

@@ -28,7 +28,7 @@ heso is Rust. Install the toolchain from <https://rustup.rs>; the
 [`rust-toolchain.toml`](rust-toolchain.toml) pin governs the version.
 
 ```sh
-git clone https://github.com/blank3rs/heso
+git clone https://github.com/heso-inc/heso
 cd heso
 cargo build --release -p heso-cli
 ./target/release/heso open https://example.com

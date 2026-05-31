@@ -119,8 +119,8 @@ function _findBinary() {
     throw new HesoError(
       `heso: no prebuilt binary for ${key}. ` +
         `Supported: win32-x64, linux-x64, linux-arm64, darwin-x64, darwin-arm64. ` +
-        `Track other-platform progress at https://github.com/blank3rs/heso/releases ` +
-        `or build from source: cargo install --git https://github.com/blank3rs/heso heso-cli`,
+        `Track other-platform progress at https://github.com/heso-inc/heso/releases ` +
+        `or build from source: cargo install --git https://github.com/heso-inc/heso heso-cli`,
     );
   }
 
