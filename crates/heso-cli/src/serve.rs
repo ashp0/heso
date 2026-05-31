@@ -1785,8 +1785,13 @@ mod tests {
             default.contains(&crate::search::BackendId::Mojeek),
             "RPC default pool must include mojeek: {default:?}"
         );
-        // And it must be the breadth pool, not a two-engine fallback.
-        assert!(default.len() >= 5, "RPC default pool too small: {default:?}");
+        // And it must be the breadth pool, not the old two-engine fallback
+        // ([Ddg, Wiki]) the RPC-drift bug shipped. The DuckDuckGo endpoints
+        // are now opt-in (they 202/403-throttle per IP and only added a
+        // `blocked` row from a normal egress IP), so the always-on pool is
+        // the four loud-failing independent sources: Mojeek, Brave,
+        // Marginalia, Wiki.
+        assert!(default.len() >= 4, "RPC default pool too small: {default:?}");
     }
 
     #[test]

@@ -31,11 +31,14 @@ pub(crate) enum BackendId {
     Brave,
     /// Marginalia — small independent index with a public JSON API.
     Marginalia,
-    /// DuckDuckGo HTML endpoint (`html.duckduckgo.com`). Best-effort: DDG
-    /// throttles scripted callers hard per IP.
+    /// DuckDuckGo HTML endpoint (`html.duckduckgo.com`). Opt-in, NOT in the
+    /// default pool: DDG `202`/`403`-throttles scripted callers hard per IP,
+    /// so from a normal egress IP it only ever adds a `blocked` row. Request
+    /// it explicitly via `--engines ddg` (works from residential/proxied
+    /// egress).
     DdgHtml,
-    /// DuckDuckGo lite endpoint (`lite.duckduckgo.com`). Same gate as the
-    /// HTML endpoint; a lighter-weight table layout.
+    /// DuckDuckGo lite endpoint (`lite.duckduckgo.com`). Opt-in like
+    /// [`DdgHtml`](BackendId::DdgHtml); same per-IP gate, lighter table layout.
     DdgLite,
     /// SearXNG — only in the default pool when a base URL is configured.
     SearxNg,
@@ -76,37 +79,35 @@ impl BackendId {
         }
     }
 
-    /// True for a backend that needs no API key and no operator config —
-    /// the always-on default pool. SearXNG is conditionally default: it
-    /// only belongs to the default sweep when a base URL is configured, so
-    /// it is excluded here and added by the orchestrator when a URL is
-    /// present. A future keyed backend (Brave API, Serper, …) returns
-    /// `false` here and joins the pool only when its key is set, without
-    /// the orchestrator's default sweep changing.
+    /// True for a backend in the always-on default sweep. SearXNG is
+    /// excluded — it is conditionally default, added by the orchestrator only
+    /// when a base URL is configured. The DuckDuckGo endpoints are excluded
+    /// too: they need no key, but they `202`/`403`-throttle scripted callers
+    /// per IP, so they are opt-in (`--engines ddg,ddg-lite`) rather than
+    /// always-on, keeping a normal-egress default search clean. A future
+    /// keyed backend (Brave API, Serper, …) likewise returns `false` and
+    /// joins only when its key is set, without changing the default sweep.
     pub(crate) fn is_default(&self) -> bool {
         matches!(
             self,
-            BackendId::Mojeek
-                | BackendId::Brave
-                | BackendId::Marginalia
-                | BackendId::DdgHtml
-                | BackendId::DdgLite
-                | BackendId::Wiki
+            BackendId::Mojeek | BackendId::Brave | BackendId::Marginalia | BackendId::Wiki
         )
     }
 }
 
-/// The always-on default pool, in priority order (independent indexes
-/// that fail loud via clean status codes lead; the DDG endpoints are the
-/// best-effort secondary). SearXNG is appended by the orchestrator only
+/// The always-on default pool, in priority order: independent indexes that
+/// fail loud via clean status codes. The DuckDuckGo endpoints are
+/// deliberately NOT here — they `202`/`403`-throttle scripted callers per
+/// IP, so on a normal egress IP they never returned results and only added
+/// a `blocked`/`errors` row to every response, making a working search look
+/// broken. They stay reachable opt-in via `--engines ddg,ddg-lite` for
+/// residential/proxied egress. SearXNG is appended by the orchestrator only
 /// when a base URL is configured, so it is absent here. Wikipedia is the
 /// knowledge block and is appended last.
 pub(crate) const DEFAULT_POOL: &[BackendId] = &[
     BackendId::Mojeek,
     BackendId::Brave,
     BackendId::Marginalia,
-    BackendId::DdgHtml,
-    BackendId::DdgLite,
     BackendId::Wiki,
 ];
 

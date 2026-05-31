@@ -2,11 +2,12 @@
 //!
 //! `heso search <query>` — first-class multi-source web search verb. Pure
 //! HTTP + HTML/JSON parsing; no JS engine is spun up. The default pool is
-//! a breadth of independent indexes — Mojeek, Brave, Marginalia — backed
-//! by the two DuckDuckGo endpoints (HTML and lite) and the Wikipedia REST
-//! `summary` knowledge block, with no API keys and no signup. SearXNG
-//! joins the default sweep when a base URL is configured via `--searx-url`
-//! or `HESO_SEARX_URL`.
+//! a breadth of independent indexes — Mojeek, Brave, Marginalia — plus the
+//! Wikipedia REST `summary` knowledge block, with no API keys and no
+//! signup. The two DuckDuckGo endpoints (HTML and lite) are opt-in via
+//! `--engines ddg,ddg-lite` (they 202/403-throttle scripted callers per
+//! IP). SearXNG joins the default sweep only when a base URL is configured
+//! via `--searx-url` or `HESO_SEARX_URL`.
 //!
 //! Querying several independent indexes is the redundancy that makes the
 //! verb reliable: when one backend throttles, the others carry the result
@@ -124,7 +125,7 @@
 //! Each backend fetches page 0 only by default; it pages further ONLY
 //! while the previous page came back clean (parseable, non-empty) AND the
 //! `--limit` is not yet met, hard-capped per backend. Because the pool's
-//! breadth (Mojeek + Brave + Marginalia + the two DDG endpoints) already
+//! breadth (Mojeek + Brave + Marginalia) already
 //! fills a modest `--limit` from first pages alone, the common case is one
 //! request per backend — the single biggest reduction in request volume.
 //!
@@ -337,6 +338,22 @@ pub async fn cmd_search(args: &[String]) -> ExitCode {
     };
     println!("{serialized}");
     if no_results && no_knowledge && was_blocked {
+        // Every backend we asked declined. This is the one case worth a
+        // stderr line — emitted here, once, instead of per-backend during
+        // the sweep, so a partial/full success never prints anything and a
+        // working search stops looking broken. The per-backend detail is in
+        // the JSON `errors`/`blocked` for programmatic callers.
+        let names = value
+            .get("blocked")
+            .and_then(|b| b.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        eprintln!("search: every backend was blocked ({names}); see errors[] in the output");
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -518,7 +535,9 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
                     engines_used.push("wiki");
                 }
                 Err(e) => {
-                    eprintln!("wikipedia search error: {e}");
+                    // Quiet on stderr: the typed row below carries it, and
+                    // `cmd_search` emits one summary line only if the whole
+                    // search came back empty. A working search stays silent.
                     errors.push(serde_json::json!({
                         "engine": "wiki",
                         "code": "transport_error",
@@ -626,7 +645,6 @@ fn record_outcome(
                 Some(s) => format!("rate limited (HTTP {s}) after {retried} retries"),
                 None => format!("rate limited after {retried} retries"),
             };
-            eprintln!("{name} rate limited: {message}");
             let mut row = serde_json::json!({
                 "engine": name,
                 "code": "rate_limited",
@@ -642,7 +660,6 @@ fn record_outcome(
         }
         BackendOutcome::BotChallenge { marker } => {
             let message = format!("bot challenge detected ({marker})");
-            eprintln!("{name} blocked: {message}");
             errors.push(serde_json::json!({
                 "engine": name,
                 "code": "bot_challenge",
@@ -654,7 +671,6 @@ fn record_outcome(
             Vec::new()
         }
         BackendOutcome::ConfigError(message) => {
-            eprintln!("{name} config error: {message}");
             errors.push(serde_json::json!({
                 "engine": name,
                 "code": "config_error",
