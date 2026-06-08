@@ -275,11 +275,20 @@ pub(crate) fn finalize_produced_plat(
         .key_path
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
-    let key = match IdentityKey::load_or_create(&key_path) {
+    // Encrypt-by-default: a freshly created key is sealed under
+    // HESO_KEY_PASSPHRASE. With no passphrase we do NOT silently write a bare
+    // seed — the auto-sign path fails closed unless plaintext is explicitly
+    // opted into (HESO_KEY_PLAINTEXT). An existing encrypted key still decrypts
+    // via the env var; an existing legacy plaintext key still loads.
+    let passphrase = signing_passphrase_from_env();
+    let plaintext = passphrase.is_none() && signing_allow_plaintext_from_env();
+    let key = match IdentityKey::load_or_create(&key_path, passphrase.as_deref(), plaintext) {
         Ok(k) => k,
         Err(e) => {
             eprintln!(
-                "failed to load or create signing identity at `{}`: {e} (pass --no-sign to emit an unsigned plat)",
+                "failed to load or create signing identity at `{}`: {e}\n  \
+                 set HESO_KEY_PASSPHRASE to encrypt the key at rest, or \
+                 HESO_KEY_PLAINTEXT=1 to store it unencrypted, or pass --no-sign",
                 key_path.display()
             );
             return Err(ExitCode::FAILURE);
@@ -432,7 +441,8 @@ fn print_banner() {
     println!("                                Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
     println!("  heso update [--dry-run]       Update every detected global heso install channel.");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
-    println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
+    println!("  heso identity init [--path P] [--plaintext]  Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
+    println!("                                Encrypted at rest by default (passphrase via HESO_KEY_PASSPHRASE or prompt); --plaintext stores the bare seed.");
     println!(
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
@@ -6216,12 +6226,20 @@ async fn stamp_to_plat(
         .key_path
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
-    let key = IdentityKey::load_or_create(&key_path).map_err(|e| {
-        format!(
-            "failed to load or create signing identity at `{}`: {e} (pass --no-sign to emit an unsigned plat)",
+    // Encrypt-by-default, same policy as the other auto-sign site: seal a new
+    // key under HESO_KEY_PASSPHRASE; with no passphrase, fail closed rather than
+    // silently writing a bare seed unless plaintext is explicitly opted into.
+    let passphrase = signing_passphrase_from_env();
+    let plaintext = passphrase.is_none() && signing_allow_plaintext_from_env();
+    let key = IdentityKey::load_or_create(&key_path, passphrase.as_deref(), plaintext).map_err(
+        |e| {
+            format!(
+            "failed to load or create signing identity at `{}`: {e} \
+             (set HESO_KEY_PASSPHRASE to encrypt, HESO_KEY_PLAINTEXT=1 for a bare seed, or --no-sign)",
             key_path.display()
         )
-    })?;
+        },
+    )?;
     heso_engine_fetch::plat::sign_inline_checked(&key, body)
         .map_err(|e| format!("failed to sign plat: {e}"))
 }
@@ -7475,7 +7493,7 @@ fn normalize_replay_ref(s: &str) -> String {
 /// already gitignored.
 fn cmd_identity(args: &[String]) -> ExitCode {
     let Some(sub) = args.first() else {
-        eprintln!("usage: heso identity <init|show> [--path <p>]");
+        eprintln!("usage: heso identity <init|show> [--path <p>] [--plaintext]");
         return ExitCode::from(2);
     };
     match sub.as_str() {
@@ -7483,7 +7501,7 @@ fn cmd_identity(args: &[String]) -> ExitCode {
         "show" => cmd_identity_show(&args[1..]),
         other => {
             eprintln!("unknown identity subcommand: {other}");
-            eprintln!("usage: heso identity <init|show> [--path <p>]");
+            eprintln!("usage: heso identity <init|show> [--path <p>] [--plaintext]");
             ExitCode::from(2)
         }
     }
@@ -7513,9 +7531,106 @@ fn parse_identity_path(args: &[String]) -> Result<PathBuf, ExitCode> {
     Ok(path.unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH)))
 }
 
+/// Parse `[--path <p>] [--plaintext|--legacy]` for `identity init`. Returns
+/// the chosen path and whether plaintext (unencrypted) storage was requested.
+fn parse_identity_init_args(args: &[String]) -> Result<(PathBuf, bool), ExitCode> {
+    let mut path: Option<PathBuf> = None;
+    let mut plaintext = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--path needs a value");
+                    return Err(ExitCode::from(2));
+                };
+                path = Some(PathBuf::from(v));
+                i += 2;
+            }
+            // `--legacy` is an alias for `--plaintext`: opt out of at-rest
+            // encryption and write the historical bare 32-byte seed.
+            "--plaintext" | "--legacy" => {
+                plaintext = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("unknown flag `{other}`");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok((
+        path.unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH)),
+        plaintext,
+    ))
+}
+
+/// Resolve the passphrase for a *new* encrypted key.
+///
+/// Order: `HESO_KEY_PASSPHRASE` env var (non-interactive, for CI/bindings),
+/// else a no-echo TTY prompt with confirmation. Errors if there is no env var
+/// and stdin is not a terminal (so non-interactive use without the env var
+/// fails loudly rather than hanging).
+fn resolve_new_key_passphrase() -> Result<String, ExitCode> {
+    if let Ok(p) = env::var(heso_core::PASSPHRASE_ENV) {
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!(
+            "no passphrase available: set {} or run interactively \
+             (or pass --plaintext to store the key unencrypted)",
+            heso_core::PASSPHRASE_ENV
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    let pass = rpassword::prompt_password("Passphrase for new identity key: ")
+        .map_err(|e| {
+            eprintln!("failed to read passphrase: {e}");
+            ExitCode::FAILURE
+        })?;
+    if pass.is_empty() {
+        eprintln!("passphrase must not be empty (or pass --plaintext)");
+        return Err(ExitCode::FAILURE);
+    }
+    let confirm = rpassword::prompt_password("Confirm passphrase: ").map_err(|e| {
+        eprintln!("failed to read passphrase confirmation: {e}");
+        ExitCode::FAILURE
+    })?;
+    if pass != confirm {
+        eprintln!("passphrases did not match");
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(pass)
+}
+
+/// Resolve the passphrase used by the auto-sign paths (`load_or_create`).
+///
+/// Returns `Some` only from the `HESO_KEY_PASSPHRASE` env var. The auto-sign
+/// closures run mid-pipeline (often non-interactive), so they never block on a
+/// TTY: if the on-disk key is encrypted and the env var is unset, the load
+/// fails with a clear `PassphraseRequired` message pointing the user at the
+/// env var. Returning `None` here lets a legacy plaintext key keep loading and
+/// makes a fresh key encrypt-by-default only when the env var is present.
+fn signing_passphrase_from_env() -> Option<String> {
+    env::var(heso_core::PASSPHRASE_ENV).ok().filter(|p| !p.is_empty())
+}
+
+/// Explicit opt-in to an UNENCRYPTED auto-created signing key, via
+/// `HESO_KEY_PLAINTEXT` (truthy: `1`/`true`/`yes`/`on`). Without this — and with
+/// no `HESO_KEY_PASSPHRASE` — the auto-sign path refuses to create a bare seed:
+/// plaintext is never the silent default. (Loading an existing legacy plaintext
+/// key is unaffected; this only gates CREATING a new unencrypted key.)
+fn signing_allow_plaintext_from_env() -> bool {
+    env::var(heso_core::PLAINTEXT_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn cmd_identity_init(args: &[String]) -> ExitCode {
-    let path = match parse_identity_path(args) {
-        Ok(p) => p,
+    let (path, plaintext) = match parse_identity_init_args(args) {
+        Ok(v) => v,
         Err(code) => return code,
     };
     if path.exists() {
@@ -7527,7 +7642,16 @@ fn cmd_identity_init(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let key = IdentityKey::generate();
-    if let Err(e) = key.save(&path) {
+    let (save_result, encrypted) = if plaintext {
+        (key.save(&path), false)
+    } else {
+        let passphrase = match resolve_new_key_passphrase() {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        (key.save_encrypted(&path, &passphrase), true)
+    };
+    if let Err(e) = save_result {
         eprintln!("failed to save identity to `{}`: {e}", path.display());
         return ExitCode::FAILURE;
     }
@@ -7537,6 +7661,7 @@ fn cmd_identity_init(args: &[String]) -> ExitCode {
         "public_key": key.public_key_b64(),
         "fingerprint": key.fingerprint(),
         "algorithm": "Ed25519",
+        "encrypted": encrypted,
     });
     match serde_json::to_string_pretty(&body) {
         Ok(s) => {
