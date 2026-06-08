@@ -21,6 +21,12 @@ base64 = { workspace = true }
 # not depend on heso-verify, so the producer side computes it inline here
 # rather than inverting the engine -> verify dependency direction.
 blake3 = { workspace = true }
+# At-rest seed encryption (Blueprint C; ADR 0031). `keystore` seals the
+# 32-byte Ed25519 seed with AES-256-GCM under an Argon2id-derived key and
+# zeroizes the plaintext seed + derived key on drop.
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true

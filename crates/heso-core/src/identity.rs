@@ -48,6 +48,20 @@ use ed25519_dalek::{
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
+use crate::keystore::{self, Container, KeystoreError};
+
+/// Environment variable that supplies the passphrase for an encrypted
+/// (`HSK1`) seed when none is passed explicitly. Lets the keyless library
+/// path (`load`) and non-interactive contexts (CI, bindings) decrypt without
+/// a TTY prompt.
+pub const PASSPHRASE_ENV: &str = "HESO_KEY_PASSPHRASE";
+
+/// Env var that explicitly opts a freshly auto-created signing key OUT of
+/// at-rest encryption (truthy: `1`/`true`/`yes`/`on`). With no passphrase and
+/// this unset, the auto-sign path fails closed instead of silently writing a
+/// bare seed — plaintext is never the silent default.
+pub const PLAINTEXT_ENV: &str = "HESO_KEY_PLAINTEXT";
+
 /// The algorithm name embedded in the on-the-wire [`Signature`] envelope.
 /// Currently the only supported choice.
 pub const SIG_ALGORITHM: &str = "Ed25519";
@@ -98,29 +112,52 @@ impl IdentityKey {
     }
 
     /// Load the identity at `path`, or generate and save a fresh one if
-    /// the file is absent. Generation uses the same `OsRng` path as
-    /// [`IdentityKey::generate`].
+    /// the file is absent.
+    ///
+    /// **Encrypt-by-default.** When a new key is created it is sealed at rest
+    /// (`HSK1` + AES-256-GCM + Argon2id) unless `plaintext` is `true`. The
+    /// passphrase is resolved in order: the explicit `passphrase` argument,
+    /// then the `HESO_KEY_PASSPHRASE` environment variable. A missing
+    /// passphrase when encryption is required is an error — callers that can
+    /// prompt a TTY should resolve it themselves and pass it in.
+    ///
+    /// Loading an existing file auto-detects the format: a legacy bare 32-byte
+    /// seed loads with no passphrase; an `HSK1` container is decrypted with the
+    /// resolved passphrase.
+    ///
+    /// Generation uses the same `OsRng` path as [`IdentityKey::generate`].
     ///
     /// Concurrency: two first-run processes can both observe the missing
-    /// file and race to create it. The loser of the [`save`](Self::save)
-    /// race gets [`IdentityError::AlreadyExists`] and falls back to
-    /// loading the now-present file, so both end up on the same key.
+    /// file and race to create it. The loser of the save race gets
+    /// [`IdentityError::AlreadyExists`] and falls back to loading the
+    /// now-present file, so both end up on the same key.
     ///
     /// On first creation, a single line is written to **stderr** (never
     /// stdout — stdout stays pure JSON for the artifact) announcing the
     /// new identity and its fingerprint, so signing-by-default is
     /// discoverable without polluting the plat.
-    pub fn load_or_create(path: &Path) -> Result<Self, IdentityError> {
-        match Self::load(path) {
+    pub fn load_or_create(
+        path: &Path,
+        passphrase: Option<&str>,
+        plaintext: bool,
+    ) -> Result<Self, IdentityError> {
+        match Self::load_with_passphrase(path, passphrase) {
             Ok(key) => Ok(key),
             Err(IdentityError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 let key = Self::generate();
-                match key.save(path) {
+                let save_result = if plaintext {
+                    key.save(path)
+                } else {
+                    let pass = resolve_passphrase(passphrase)?;
+                    key.save_encrypted(path, &pass)
+                };
+                match save_result {
                     Ok(()) => {
+                        let how = if plaintext { "plaintext" } else { "encrypted" };
                         eprintln!(
-                            "heso: created a new signing identity at {} (fingerprint {})",
+                            "heso: created a new {how} signing identity at {} (fingerprint {})",
                             path.display(),
                             key.fingerprint()
                         );
@@ -128,7 +165,9 @@ impl IdentityKey {
                     }
                     // Lost a first-run race: another process created the
                     // file between our load and save. Re-load it.
-                    Err(IdentityError::AlreadyExists(_)) => Self::load(path),
+                    Err(IdentityError::AlreadyExists(_)) => {
+                        Self::load_with_passphrase(path, passphrase)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -136,29 +175,97 @@ impl IdentityKey {
         }
     }
 
-    /// Load an identity from disk. The file must be exactly 32 bytes —
-    /// the raw Ed25519 seed.
+    /// Load an identity from disk, auto-detecting the on-disk format.
+    ///
+    /// A legacy bare 32-byte seed loads as before. An `HSK1` encrypted
+    /// container is decrypted with the passphrase resolved from the
+    /// `HESO_KEY_PASSPHRASE` environment variable. For explicit passphrase
+    /// control (TTY prompt, etc.) use [`load_with_passphrase`](Self::load_with_passphrase).
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
+        Self::load_with_passphrase(path, None)
+    }
+
+    /// Load an identity from disk with an explicit optional passphrase.
+    ///
+    /// Format detection is by magic byte:
+    /// - bare 32 bytes → legacy plaintext, no passphrase needed;
+    /// - `HSK1`+`0x01` → encrypted, decrypted with `passphrase` (falling back
+    ///   to `HESO_KEY_PASSPHRASE`);
+    /// - `HSK1`+`0x02` → KMS-wrapped; this method has no KMS provider, so it
+    ///   reports [`IdentityError::Keystore`] (use the keystore API directly).
+    pub fn load_with_passphrase(
+        path: &Path,
+        passphrase: Option<&str>,
+    ) -> Result<Self, IdentityError> {
         let bytes = fs::read(path).map_err(|e| IdentityError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
-        if bytes.len() != SECRET_KEY_LENGTH {
-            return Err(IdentityError::BadKeyLength {
-                path: path.to_path_buf(),
-                expected: SECRET_KEY_LENGTH,
-                actual: bytes.len(),
-            });
+        match keystore::detect(&bytes).map_err(IdentityError::Keystore)? {
+            Container::Legacy => {
+                if bytes.len() != SECRET_KEY_LENGTH {
+                    return Err(IdentityError::BadKeyLength {
+                        path: path.to_path_buf(),
+                        expected: SECRET_KEY_LENGTH,
+                        actual: bytes.len(),
+                    });
+                }
+                let mut seed = [0u8; SECRET_KEY_LENGTH];
+                seed.copy_from_slice(&bytes);
+                Ok(Self::from_bytes(&seed))
+            }
+            Container::Encrypted => {
+                let pass = resolve_passphrase(passphrase)?;
+                let seed = keystore::decrypt_seed(&bytes, &pass)
+                    .map_err(IdentityError::Keystore)?;
+                Ok(Self::from_bytes(&seed))
+            }
+            Container::KmsWrapped => Err(IdentityError::Keystore(KeystoreError::Kms(
+                "KMS-wrapped seed: supply a KmsProvider via the keystore API".into(),
+            ))),
         }
-        let mut seed = [0u8; SECRET_KEY_LENGTH];
-        seed.copy_from_slice(&bytes);
-        Ok(Self::from_bytes(&seed))
     }
 
-    /// Write the 32-byte seed to `path`. Creates parent directories as
-    /// needed. Refuses to overwrite an existing file — callers should
-    /// delete first if rotation is intended.
+    /// Write the legacy bare 32-byte seed (plaintext) to `path`. Creates
+    /// parent directories as needed. Refuses to overwrite an existing file —
+    /// callers should delete first if rotation is intended.
+    ///
+    /// This is the `--legacy`/`--plaintext` writer; the encrypt-by-default
+    /// path is [`save_encrypted`](Self::save_encrypted).
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
+        Self::publish_atomically(path, &self.signing.to_bytes())
+    }
+
+    /// Seal the 32-byte seed under `passphrase` and write the resulting
+    /// `HSK1` container to `path` (AES-256-GCM + Argon2id; see [`crate::keystore`]).
+    ///
+    /// Shares the atomic, permission-hardened, no-overwrite publish path with
+    /// [`save`](Self::save): the encrypted bytes are written to a hardened
+    /// temp inode and hard-linked into place, so `path` is only ever observed
+    /// absent or complete. Refuses to overwrite an existing file.
+    pub fn save_encrypted(&self, path: &Path, passphrase: &str) -> Result<(), IdentityError> {
+        let sealed = keystore::encrypt_seed(&self.signing.to_bytes(), passphrase)
+            .map_err(IdentityError::Keystore)?;
+        Self::publish_atomically(path, &sealed)
+    }
+
+    /// Atomically write `payload` to `path`, hardening permissions and
+    /// refusing to overwrite. Shared by the plaintext and encrypted writers.
+    ///
+    /// Writes `payload` to a unique temp file in the same directory, hardens
+    /// it (0600 / icacls), THEN hard-links it into place.
+    ///
+    /// The naive approach — `create_new(path)` then a separate `write_all` —
+    /// leaves a window where `path` exists but is still 0 bytes, so a
+    /// concurrent first-run `load()` could read the empty file and fail with
+    /// `BadKeyLength { actual: 0 }` (which `load_or_create` does not retry).
+    /// Linking a fully-written inode means `path` is only ever observed absent
+    /// or complete, never partial. `hard_link` is itself exclusive-create (it
+    /// fails `AlreadyExists` if `path` is taken), so the no-overwrite +
+    /// race-loser-reloads contract `load_or_create` relies on is preserved.
+    /// Hardening the temp inode first means the permissions/ACL are already
+    /// tight the instant `path` appears.
+    fn publish_atomically(path: &Path, payload: &[u8]) -> Result<(), IdentityError> {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(parent) = parent {
             fs::create_dir_all(parent).map_err(|e| IdentityError::Io {
@@ -167,19 +274,6 @@ impl IdentityKey {
             })?;
         }
 
-        // Write the full 32-byte key to a unique temp file in the same
-        // directory, harden it, THEN atomically link it into place.
-        //
-        // The old approach — `create_new(path)` then a separate `write_all`
-        // — left a window where `path` existed but was still 0 bytes, so a
-        // concurrent first-run `load()` could read the empty file and fail
-        // with `BadKeyLength { actual: 0 }` (which `load_or_create` does not
-        // retry). Linking a fully-written inode means `path` is only ever
-        // observed absent or complete, never partial. `hard_link` is itself
-        // exclusive-create (it fails `AlreadyExists` if `path` is taken), so
-        // the no-overwrite + race-loser-reloads contract `load_or_create`
-        // relies on is preserved. Hardening the temp inode first means the
-        // permissions/ACL are already tight the instant `path` appears.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file_name = path
@@ -202,11 +296,10 @@ impl IdentityKey {
                     path: tmp.clone(),
                     source: e,
                 })?;
-            file.write_all(&self.signing.to_bytes())
-                .map_err(|e| IdentityError::Io {
-                    path: tmp.clone(),
-                    source: e,
-                })?;
+            file.write_all(payload).map_err(|e| IdentityError::Io {
+                path: tmp.clone(),
+                source: e,
+            })?;
             Ok(())
         })();
         if let Err(e) = write_result.and_then(|()| Self::harden_permissions(&tmp)) {
@@ -428,6 +521,34 @@ pub enum IdentityError {
     /// wrong number rule.
     #[error("unsupported canonicalization tag `{0}`")]
     UnknownCanon(String),
+
+    /// At-rest keystore failure: sealing, decrypting (wrong passphrase or
+    /// tampered file), or an unsupported container kind.
+    #[error("keystore: {0}")]
+    Keystore(#[from] KeystoreError),
+
+    /// An encrypted key was requested but no passphrase was available (no
+    /// explicit value and `HESO_KEY_PASSPHRASE` unset). Interactive callers
+    /// should prompt and pass the passphrase in.
+    #[error(
+        "a passphrase is required for the encrypted identity key but none was provided \
+         (set {PASSPHRASE_ENV} or pass one explicitly)"
+    )]
+    PassphraseRequired,
+}
+
+/// Resolve the seed passphrase: explicit argument first, then the
+/// `HESO_KEY_PASSPHRASE` environment variable. Errors if neither is present.
+fn resolve_passphrase(explicit: Option<&str>) -> Result<String, IdentityError> {
+    if let Some(p) = explicit {
+        if !p.is_empty() {
+            return Ok(p.to_owned());
+        }
+    }
+    match std::env::var(PASSPHRASE_ENV) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(IdentityError::PassphraseRequired),
+    }
 }
 
 // ============================================================================
@@ -437,7 +558,12 @@ pub enum IdentityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serializes the env-var tests: `HESO_KEY_PASSPHRASE` is process-global,
+    /// so two tests mutating it concurrently would race.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn generate_produces_distinct_keys() {
@@ -645,18 +771,151 @@ mod tests {
     }
 
     #[test]
-    fn load_or_create_generates_then_loads_same_key() {
+    fn load_or_create_plaintext_generates_then_loads_same_key() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("identity.key");
         assert!(!path.exists());
 
-        let created = IdentityKey::load_or_create(&path).expect("first call creates");
+        // plaintext=true keeps the historical bare-seed behavior.
+        let created =
+            IdentityKey::load_or_create(&path, None, true).expect("first call creates");
         assert!(path.exists());
+        // On disk it really is a bare 32-byte seed (legacy format).
+        assert_eq!(fs::read(&path).unwrap().len(), SECRET_KEY_LENGTH);
         let created_pk = created.public_key_bytes();
 
         // Second call loads the now-present file — same key, no overwrite.
-        let loaded = IdentityKey::load_or_create(&path).expect("second call loads");
+        let loaded =
+            IdentityKey::load_or_create(&path, None, true).expect("second call loads");
         assert_eq!(loaded.public_key_bytes(), created_pk);
+    }
+
+    #[test]
+    fn load_or_create_encrypts_by_default_then_loads_same_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+
+        // plaintext=false (default) => sealed at rest under the passphrase.
+        let created = IdentityKey::load_or_create(&path, Some("hunter2"), false)
+            .expect("first call creates encrypted");
+        let created_pk = created.public_key_bytes();
+
+        // The on-disk file is an HSK1 encrypted container, not a bare seed.
+        let on_disk = fs::read(&path).unwrap();
+        assert_eq!(&on_disk[..4], b"HSK1");
+        assert_ne!(on_disk.len(), SECRET_KEY_LENGTH);
+
+        // Re-load with the same passphrase yields the same key.
+        let loaded = IdentityKey::load_or_create(&path, Some("hunter2"), false)
+            .expect("second call loads encrypted");
+        assert_eq!(loaded.public_key_bytes(), created_pk);
+
+        // Wrong passphrase fails closed.
+        match IdentityKey::load_with_passphrase(&path, Some("wrong")) {
+            Err(IdentityError::Keystore(_)) => {}
+            other => panic!("expected Keystore decrypt error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_encrypted_then_load_with_passphrase_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+
+        let original = IdentityKey::generate();
+        let original_pk = original.public_key_bytes();
+        original.save_encrypted(&path, "s3cret").expect("encrypted save ok");
+
+        let loaded =
+            IdentityKey::load_with_passphrase(&path, Some("s3cret")).expect("decrypt load ok");
+        assert_eq!(loaded.public_key_bytes(), original_pk);
+
+        // A payload signed by the decrypted key verifies.
+        let sig = loaded.sign(b"after encrypted load");
+        sig.verify(b"after encrypted load")
+            .expect("decrypted key signs+verifies");
+    }
+
+    #[test]
+    fn legacy_plaintext_seed_still_loads_without_passphrase() {
+        // A pre-existing bare 32-byte seed must keep loading untouched after
+        // the encrypt-by-default change — no passphrase, no migration forced.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        let seed = [7u8; SECRET_KEY_LENGTH];
+        fs::write(&path, seed).unwrap();
+
+        let loaded = IdentityKey::load(&path).expect("legacy bare seed loads");
+        assert_eq!(loaded.public_key_bytes(), IdentityKey::from_bytes(&seed).public_key_bytes());
+    }
+
+    #[test]
+    fn load_encrypted_uses_env_passphrase_when_none_passed() {
+        // The 1-arg `load()` (used by enterprise Ed25519Signer::load and the
+        // seal/receipts CLI paths) must transparently decrypt an HSK1 file
+        // when HESO_KEY_PASSPHRASE is set, so encrypt-by-default doesn't break
+        // those keyless callers.
+        //
+        // Guarded by a process-wide mutex: env vars are global and other
+        // tests may read PASSPHRASE_ENV.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        let key = IdentityKey::generate();
+        let pk = key.public_key_bytes();
+        key.save_encrypted(&path, "env-pass").unwrap();
+
+        let prev = std::env::var(PASSPHRASE_ENV).ok();
+        std::env::set_var(PASSPHRASE_ENV, "env-pass");
+        let loaded = IdentityKey::load(&path).expect("load() decrypts via env passphrase");
+        match prev {
+            Some(v) => std::env::set_var(PASSPHRASE_ENV, v),
+            None => std::env::remove_var(PASSPHRASE_ENV),
+        }
+        assert_eq!(loaded.public_key_bytes(), pk);
+    }
+
+    #[test]
+    fn load_encrypted_without_any_passphrase_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        IdentityKey::generate()
+            .save_encrypted(&path, "p")
+            .unwrap();
+
+        let prev = std::env::var(PASSPHRASE_ENV).ok();
+        std::env::remove_var(PASSPHRASE_ENV);
+        let result = IdentityKey::load(&path);
+        if let Some(v) = prev {
+            std::env::set_var(PASSPHRASE_ENV, v);
+        }
+        match result {
+            Err(IdentityError::PassphraseRequired) => {}
+            other => panic!("expected PassphraseRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_or_create_refuses_silent_plaintext_without_passphrase() {
+        // Security invariant: with no passphrase and plaintext=false, creating a
+        // NEW key must fail closed — never silently write a bare seed — and must
+        // leave nothing on disk. The CLI auto-sign path relies on this; a bare
+        // seed is only ever written when plaintext is explicitly opted into.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        let prev = std::env::var(PASSPHRASE_ENV).ok();
+        std::env::remove_var(PASSPHRASE_ENV);
+        let result = IdentityKey::load_or_create(&path, None, false);
+        if let Some(v) = prev {
+            std::env::set_var(PASSPHRASE_ENV, v);
+        }
+        match result {
+            Err(IdentityError::PassphraseRequired) => {}
+            other => panic!("expected PassphraseRequired, got {other:?}"),
+        }
+        assert!(!path.exists(), "must not write a key it cannot encrypt");
     }
 
     #[test]
@@ -666,7 +925,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("identity.key");
         fs::write(&path, [0u8; 31]).unwrap();
-        match IdentityKey::load_or_create(&path) {
+        match IdentityKey::load_or_create(&path, None, true) {
             Err(IdentityError::BadKeyLength { actual, .. }) => assert_eq!(actual, 31),
             other => panic!("expected BadKeyLength, got {other:?}"),
         }
