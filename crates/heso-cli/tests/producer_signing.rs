@@ -42,6 +42,10 @@ fn run_in(cwd: &Path, args: &[&str]) -> std::process::Output {
     Command::new(heso_bin())
         .args(args)
         .current_dir(cwd)
+        // These tests exercise auto-sign with no configured passphrase. The prod
+        // default now fails closed rather than silently writing a bare seed, so
+        // opt this throwaway tempdir key into plaintext explicitly.
+        .env("HESO_KEY_PLAINTEXT", "1")
         .output()
         .expect("spawn heso")
 }

@@ -63,7 +63,7 @@ async fn start_mock_server() -> (MockServer, String) {
 /// Initialize an identity in `cwd` and return its base64 public key.
 /// Mirrors what an external user would do as their first step.
 fn init_identity(cwd: &std::path::Path) -> String {
-    let out = run_in(cwd, &["identity", "init"]);
+    let out = run_in(cwd, &["identity", "init", "--plaintext"]);
     assert!(
         out.status.success(),
         "identity init failed: stderr={}",

@@ -42,8 +42,16 @@ fn heso_bin() -> PathBuf {
 fn run_search(args: &[&str]) -> std::process::Output {
     let mut cmd_args = vec!["search"];
     cmd_args.extend_from_slice(args);
+    // The on-disk search cache lives at the CWD-relative
+    // `heso-local-data/search-cache/`, keyed only by (backend, query, page) —
+    // NOT the backend URL. Tests reuse short queries like `any` against
+    // different wiremock servers, so without isolation an earlier test's
+    // cached page short-circuits a later test's distinct mock. Run each
+    // spawned binary from its own tempdir so its cache can't bleed.
+    let dir = tempfile::tempdir().expect("tempdir");
     Command::new(heso_bin())
         .args(&cmd_args)
+        .current_dir(dir.path())
         .env_remove("HESO_SEARX_URL")
         .output()
         .expect("spawn heso search")
@@ -414,8 +422,12 @@ async fn searxng_via_env_var() {
         .mount(&server)
         .await;
 
+    // Own tempdir so the CWD-relative search cache can't be pre-warmed by an
+    // earlier `any`/searxng test (the cache key omits the backend URL).
+    let dir = tempfile::tempdir().expect("tempdir");
     let out = Command::new(heso_bin())
         .args(["search", "any", "--engines", "searxng"])
+        .current_dir(dir.path())
         .env("HESO_SEARX_URL", server.uri())
         .output()
         .expect("spawn heso search");
@@ -587,9 +599,15 @@ async fn cache_ttl_zero_disables_short_circuit() {
 // `heso serve` `search` JSON-RPC method
 // ============================================================================
 
-fn spawn_serve() -> (Child, RpcClient) {
+fn spawn_serve() -> (tempfile::TempDir, Child, RpcClient) {
+    // Own tempdir CWD so the serve process's CWD-relative search cache stays
+    // isolated from sibling tests (the cache key omits the backend URL, so a
+    // shared dir lets one test's cached page short-circuit another's mock).
+    // The returned guard must outlive the child to keep the dir on disk.
+    let dir = tempfile::tempdir().expect("tempdir");
     let mut child = Command::new(heso_bin())
         .arg("serve")
+        .current_dir(dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -600,7 +618,7 @@ fn spawn_serve() -> (Child, RpcClient) {
     let stdout = child.stdout.take().expect("stdout");
     let reader = BufReader::new(stdout);
     let client = RpcClient { stdin, reader, next_id: 1 };
-    (child, client)
+    (dir, child, client)
 }
 
 struct RpcClient {
@@ -648,7 +666,7 @@ impl Drop for KillOnDrop {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ready_advertises_search_method() {
-    let (child, mut client) = spawn_serve();
+    let (_dir, child, mut client) = spawn_serve();
     let _g = KillOnDrop(child);
     let ready = client.read_ready();
     let methods: Vec<&str> = ready["params"]["methods"]
@@ -680,7 +698,7 @@ async fn rpc_search_searxng_returns_results() {
         .mount(&server)
         .await;
 
-    let (child, mut client) = spawn_serve();
+    let (_dir, child, mut client) = spawn_serve();
     let _g = KillOnDrop(child);
     let _ = client.read_ready();
 
@@ -709,7 +727,7 @@ async fn rpc_search_accepts_csv_engines_string() {
         .mount(&server)
         .await;
 
-    let (child, mut client) = spawn_serve();
+    let (_dir, child, mut client) = spawn_serve();
     let _g = KillOnDrop(child);
     let _ = client.read_ready();
 
