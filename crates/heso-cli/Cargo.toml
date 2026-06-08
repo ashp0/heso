@@ -62,6 +62,9 @@ httpdate = { workspace = true }
 # cost. For a one-shot CLI on Windows this is one of the largest
 # cold-start wins per line of code.
 mimalloc = { version = "0.1", default-features = false }
+# No-echo TTY passphrase prompt for the encrypt-by-default identity key
+# (Blueprint C). Only prompts interactively; HESO_KEY_PASSPHRASE bypasses it.
+rpassword = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

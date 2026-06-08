@@ -74,6 +74,17 @@ regex = "1"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "rand_core"] }
 rand_core = { version = "0.6", default-features = false, features = ["std", "getrandom"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
+# At-rest seed encryption (Blueprint C; ADR 0031). The 32-byte Ed25519
+# seed is sealed with AES-256-GCM under an Argon2id-derived key. `zeroize`
+# wipes the decrypted seed + derived key from memory on drop. All pure-Rust
+# RustCrypto; `aes-gcm` 0.10 / `argon2` 0.5 are the current stable lines and
+# do NOT pull a second `rand_core` major (salt/nonce come from `OsRng`, the
+# same `rand_core` 0.6 the ed25519 path already uses).
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# No-echo TTY passphrase prompt for `heso identity init`. Tiny, no async.
+rpassword = "7"
 # Always-on search resilience (Workstream A; ADR 0026). Runtime-agnostic
 # retry with full-jitter exponential backoff; `fastrand`-only at runtime,
 # per-call `.when()` predicate to retry throttles while accepting genuine

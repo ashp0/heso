@@ -48,7 +48,7 @@ fn seal_plat_produces_a_sealed_envelope() {
     let dir = TempDir::new().unwrap();
     // Initialize an identity in the temp dir so the default key path
     // resolves cleanly under `current_dir`.
-    let init = run_in(dir.path(), &["identity", "init"]);
+    let init = run_in(dir.path(), &["identity", "init", "--plaintext"]);
     assert!(init.status.success());
 
     let plat = minimal_plat(dir.path());
@@ -106,7 +106,7 @@ fn seal_refuses_template() {
 #[test]
 fn unseal_extract_returns_inner_plat() {
     let dir = TempDir::new().unwrap();
-    let init = run_in(dir.path(), &["identity", "init"]);
+    let init = run_in(dir.path(), &["identity", "init", "--plaintext"]);
     assert!(init.status.success());
 
     let plat = minimal_plat(dir.path());

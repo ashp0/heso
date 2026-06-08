@@ -15,7 +15,16 @@
 pub use url::Url;
 
 mod identity;
-pub use identity::{IdentityError, IdentityKey, Signature, SignaturePayload, SIG_ALGORITHM};
+pub use identity::{
+    IdentityError, IdentityKey, Signature, SignaturePayload, PASSPHRASE_ENV, PLAINTEXT_ENV,
+    SIG_ALGORITHM,
+};
+
+mod keystore;
+pub use keystore::{
+    decrypt_seed, detect, encrypt_seed, unwrap_seed, wrap_seed, Container, KeystoreError,
+    KmsProvider, MockKms,
+};
 
 /// Workspace-wide result alias. Use this in public APIs of crates that
 /// build on `heso-core`.

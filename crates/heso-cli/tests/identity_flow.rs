@@ -26,23 +26,38 @@ fn run_in(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
         .expect("spawn heso")
 }
 
+/// Run `heso <args>` in `cwd` with `HESO_KEY_PASSPHRASE` set. Exercises the
+/// encrypt-by-default path non-interactively (no TTY in a test subprocess).
+fn run_in_with_pass(
+    cwd: &std::path::Path,
+    pass: &str,
+    args: &[&str],
+) -> std::process::Output {
+    Command::new(heso_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("HESO_KEY_PASSPHRASE", pass)
+        .output()
+        .expect("spawn heso")
+}
+
 #[test]
-fn identity_init_creates_a_keyfile_and_prints_public_key() {
+fn identity_init_plaintext_creates_a_bare_seed_keyfile() {
+    // `--plaintext` opt-out writes the historical bare 32-byte seed.
     let dir = TempDir::new().unwrap();
-    let out = run_in(dir.path(), &["identity", "init"]);
+    let out = run_in(dir.path(), &["identity", "init", "--plaintext"]);
     assert!(
         out.status.success(),
-        "identity init failed: stderr={}",
+        "identity init --plaintext failed: stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let body: serde_json::Value =
         serde_json::from_str(&stdout).expect("identity init stdout is JSON");
     assert_eq!(body["algorithm"], "Ed25519");
+    assert_eq!(body["encrypted"], false, "--plaintext reports encrypted=false");
     let pk = body["public_key"].as_str().expect("public_key string");
     assert_eq!(pk.len(), 44, "base64 of 32 bytes is 44 chars");
-    // The fingerprint is the SSH-style short id users compare out-of-band:
-    // `heso:` + 32 lowercase hex chars (BLAKE3 of the pubkey, first 16 B).
     let fp = body["fingerprint"].as_str().expect("fingerprint string");
     let hex = fp.strip_prefix("heso:").expect("fingerprint is `heso:`-prefixed");
     assert_eq!(hex.len(), 32, "fingerprint is 16 bytes => 32 hex chars");
@@ -50,19 +65,65 @@ fn identity_init_creates_a_keyfile_and_prints_public_key() {
         hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "fingerprint hex is lowercase: {fp}"
     );
-    // Keyfile must exist at the default path.
     let key_path = dir.path().join("heso-local-data").join("identity.key");
     let bytes = std::fs::read(&key_path).expect("identity.key was written");
-    assert_eq!(bytes.len(), 32, "key file is exactly 32 raw seed bytes");
+    assert_eq!(bytes.len(), 32, "plaintext key file is exactly 32 raw seed bytes");
+}
+
+#[test]
+fn identity_init_encrypts_by_default_with_env_passphrase() {
+    // With HESO_KEY_PASSPHRASE set and no --plaintext, the key is sealed at
+    // rest: the on-disk file is an HSK1 container, not a bare 32-byte seed.
+    let dir = TempDir::new().unwrap();
+    let out = run_in_with_pass(dir.path(), "s3cret-pass", &["identity", "init"]);
+    assert!(
+        out.status.success(),
+        "encrypted identity init failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("init json");
+    assert_eq!(body["encrypted"], true, "default init reports encrypted=true");
+
+    let key_path = dir.path().join("heso-local-data").join("identity.key");
+    let bytes = std::fs::read(&key_path).expect("identity.key was written");
+    assert_eq!(&bytes[..4], b"HSK1", "encrypted file carries the HSK1 magic");
+    assert_ne!(bytes.len(), 32, "encrypted file is not a bare 32-byte seed");
+
+    // `identity show` reads it back via HESO_KEY_PASSPHRASE and reports the
+    // same public key — proving the seal round-trips through the CLI.
+    let show = run_in_with_pass(dir.path(), "s3cret-pass", &["identity", "show"]);
+    assert!(
+        show.status.success(),
+        "encrypted identity show failed: stderr={}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let show_body: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
+    assert_eq!(show_body["public_key"], body["public_key"]);
+}
+
+#[test]
+fn identity_show_on_encrypted_key_without_passphrase_fails() {
+    // The encrypted key must NOT load without the passphrase: a leaked file
+    // alone is useless.
+    let dir = TempDir::new().unwrap();
+    let init = run_in_with_pass(dir.path(), "pw", &["identity", "init"]);
+    assert!(init.status.success());
+
+    let show = run_in(dir.path(), &["identity", "show"]); // no env passphrase
+    assert!(
+        !show.status.success(),
+        "show on encrypted key without passphrase must fail; stdout={}",
+        String::from_utf8_lossy(&show.stdout)
+    );
 }
 
 #[test]
 fn identity_init_refuses_to_overwrite() {
     let dir = TempDir::new().unwrap();
-    let first = run_in(dir.path(), &["identity", "init"]);
+    let first = run_in(dir.path(), &["identity", "init", "--plaintext"]);
     assert!(first.status.success());
 
-    let second = run_in(dir.path(), &["identity", "init"]);
+    let second = run_in(dir.path(), &["identity", "init", "--plaintext"]);
     assert!(
         !second.status.success(),
         "second identity init must fail; stdout={}",
@@ -78,7 +139,7 @@ fn identity_init_refuses_to_overwrite() {
 #[test]
 fn identity_show_prints_the_same_public_key_as_init() {
     let dir = TempDir::new().unwrap();
-    let init = run_in(dir.path(), &["identity", "init"]);
+    let init = run_in(dir.path(), &["identity", "init", "--plaintext"]);
     assert!(init.status.success());
     let init_body: serde_json::Value = serde_json::from_slice(&init.stdout).expect("init json");
     let init_pk = init_body["public_key"].as_str().unwrap().to_owned();
@@ -105,7 +166,7 @@ fn identity_show_with_explicit_path() {
     let custom = dir.path().join("custom.key");
     let init = run_in(
         dir.path(),
-        &["identity", "init", "--path", custom.to_str().unwrap()],
+        &["identity", "init", "--plaintext", "--path", custom.to_str().unwrap()],
     );
     assert!(
         init.status.success(),

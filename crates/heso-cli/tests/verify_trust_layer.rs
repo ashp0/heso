@@ -547,7 +547,7 @@ fn seal_strips_inline_sig_and_produces_a_valid_envelope() {
     // envelope still verifies (now via the sealed-plat trust path).
     let dir = TempDir::new().unwrap();
     // The sealing identity must exist at the default path.
-    assert!(run_in(dir.path(), &["identity", "init"]).status.success());
+    assert!(run_in(dir.path(), &["identity", "init", "--plaintext"]).status.success());
 
     let signer = IdentityKey::generate();
     let plat = sign(&signer, body_with_lineage("site:seal013", "x"));

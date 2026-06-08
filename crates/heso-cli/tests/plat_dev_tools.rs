@@ -152,7 +152,7 @@ fn temp_key_path(suffix: &str) -> PathBuf {
 /// keeps the test crate's dep graph at just the binary under test.
 fn init_identity(path: &std::path::Path) {
     let out = Command::new(heso_bin())
-        .args(["identity", "init", "--path", path.to_str().unwrap()])
+        .args(["identity", "init", "--plaintext", "--path", path.to_str().unwrap()])
         .output()
         .expect("spawn heso identity init");
     assert!(
