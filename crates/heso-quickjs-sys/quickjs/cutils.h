@@ -1060,13 +1060,15 @@ static inline int utf8_scan(const char *buf, size_t buf_len, size_t *plen)
     int kind = UTF8_PLAIN_ASCII;
 
     // The buffer is treated as 4 (or 8) bytes instead of 1 byte per item.
-    const size_t *p_size = (const size_t *)p;
     const size_t buf_len_size = buf_len / sizeof(size_t);
     const size_t msb_mask = ~(size_t)0 / 255 * 0x80;
 
     for (size_t i = 0; i < buf_len_size; i++) {
+        // Safely load the chunk to avoid strict aliasing and unaligned access violations.
+        size_t chunk;
+        memcpy(&chunk, p + len, sizeof(size_t));
         // Compare the significant bit: 1....... 1....... 1....... 1.......
-        if ((p_size[i] & msb_mask) != 0) {
+        if ((chunk & msb_mask) != 0) {
             kind = UTF8_NON_ASCII;
             break; // Found non-ASCII! Break cleanly to fallback loop.
         }
