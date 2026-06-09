@@ -1,6 +1,11 @@
 # heso — the auditable layer for the agent web.
 
-**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/heso-inc/heso/releases)**
+**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso-runtime/)** · **[Releases](https://github.com/heso-inc/heso/releases)**
+
+> This repo also hosts the **open verifier for heso ActionReceipts** — the
+> signed receipts the [heso SDK](https://www.heso.ca) mints for AI-agent
+> actions. Anyone can verify a receipt offline with heso removed from the
+> loop. See [Verify ActionReceipts](#verify-actionreceipts-the-open-verifier).
 
 A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of the run.
 
@@ -36,6 +41,7 @@ A 50-second real recording — an LLM agent (Gemini) drives heso to find and com
 - [Use as an agent skill](#use-as-an-agent-skill)
 - [Global flags](#global-flags)
 - [Stats](#stats)
+- [Verify ActionReceipts (the open verifier)](#verify-actionreceipts-the-open-verifier)
 - [Building from source](#building-from-source)
 - [Status](#status)
 - [License](#license)
@@ -492,6 +498,29 @@ Measured on macOS (Apple arm64), with the release binary:
 | Engine-only (no network, local fixture) | ~11 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.3 s total |
 | Search (5 results) | ~1.4 s |
+
+## Verify ActionReceipts (the open verifier)
+
+The [heso SDK](https://www.heso.ca) gates and signs every action an AI agent
+takes — LLM call, tool call, payment, delete — into an **ActionReceipt**: an
+offline-verifiable, Ed25519-signed, BLAKE3-chained record, optionally
+co-signed by a human approver with a key only they hold.
+
+This repo carries the open, MIT/Apache-licensed verify path, so a receipt can
+be checked **with heso entirely removed from the loop**:
+
+- [`crates/heso-action`](crates/heso-action) — the verifier library
+  (canonicalization, signature + chain verification, golden vectors pinned
+  byte-identical to the producer suite).
+- [`crates/heso-verify-cli`](crates/heso-verify-cli) — the standalone CLI:
+  `heso-verify-cli <receipts.jsonl> <public_key_file>` → `VALID` / exit codes.
+  Vendored into every evidence bundle the SDK exports.
+- [`spec/ACTION-RECEIPT-2.0.md`](spec/ACTION-RECEIPT-2.0.md),
+  [`spec/ACTION-RECEIPT-1.0.md`](spec/ACTION-RECEIPT-1.0.md),
+  [`spec/TRANSPARENCY-1.0.md`](spec/TRANSPARENCY-1.0.md) — the normative wire
+  formats those crates implement.
+
+Or verify in the browser, nothing uploaded: [heso.ca/verify](https://heso.ca/verify).
 
 ## Building from source
 
