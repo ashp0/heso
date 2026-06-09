@@ -12,6 +12,11 @@ members = [
     "crates/heso-cli",
     "crates/heso-compat-tests",
     "crates/heso-compat-suite",
+    # The ActionReceipt verify-only surface (open port of the receipt verifier).
+    # Leaf crates: nothing else in this workspace depends on them; they depend
+    # DOWN on heso-verify (+ heso-core in tests only).
+    "crates/heso-action",
+    "crates/heso-verify-cli",
 ]
 # Vendored fork of rquickjs-sys 0.11.0 that compiles the hesojs determinism-
 # hardened QuickJS-NG fork instead of stock quickjs-ng (see ADR 0030). It is a

@@ -26,3 +26,12 @@ jobs:
         run: cargo test -p heso-engine-fetch plat::tests
       - name: Stateful RPC guard
         run: cargo test -p heso-cli --test serve_stateful_rpc
+      # The ActionReceipt verify surface: the golden vectors pinned in these
+      # tests are the byte-identical contract with the producer suite — a
+      # drift here is a wire-format break, not a flake. The second run turns
+      # on the RFC-3161 crypto (`tsa`) so the pinned-roots build.rs assertion
+      # and the CMS/TSTInfo verify path stay green too.
+      - name: ActionReceipt verifier guard
+        run: cargo test -p heso-action -p heso-verify-cli
+      - name: ActionReceipt verifier guard (tsa)
+        run: cargo test -p heso-action --features tsa

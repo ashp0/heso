@@ -1,0 +1,50 @@
+[package]
+name = "heso-verify-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The dependency-light CLI ActionReceipt verifier a relying party runs with ZERO heso install. Reuses heso-action's offline verify (verify_action_receipt + verify_action_receipt_chain) and the always-on RFC-3161 anchor check VERBATIM; adds only argv parsing + a stable --json contract and graded exit codes (0 valid / 1 invalid / 2 wrong-alg-or-hash / 64 usage). It is what gets vendored into an evidence bundle's VERIFY.sh."
+
+[[bin]]
+name = "heso-verify-cli"
+path = "src/main.rs"
+
+# Keep the cargo-dist release pipeline byte-stable: this binary is not in the
+# GitHub-Releases artifact set yet. Flip deliberately (and run `dist generate`)
+# when the evidence-bundle distribution story lands.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+# The single dependency that matters: heso-action carries the wire types AND the
+# offline verify path (which itself reuses heso-verify for RFC-8785/JCS
+# canonicalization + BLAKE3 + Ed25519 verify_strict). Reusing it VERBATIM is the
+# whole point — the standalone binary must reproduce the exact verdict the
+# producer's `verify` surface does, not a second implementation that could drift.
+heso-action = { path = "../heso-action" }
+
+# argv-only; no clap. serde_json to read the JSONL receipts and emit the --json
+# verdict. base64 to validate the public-key argument shape.
+serde_json.workspace = true
+base64.workspace = true
+
+[features]
+# Forward the heso-action `tsa` feature so a bundle can be built with the real
+# RFC-3161 crypto when the relying party needs trusted-time verification. OFF by
+# default keeps the vendored binary tiny and the verify path fail-closed on a
+# present anchor it cannot check.
+default = []
+tsa = ["heso-action/tsa"]
+
+[dev-dependencies]
+# The verifier crate itself never signs (it only checks), so the house signer is
+# a TEST-ONLY dependency used to mint the fixtures the verdict logic is asserted
+# against — the same all-zero golden seed the rest of the project pins.
+heso-core = { path = "../heso-core" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
