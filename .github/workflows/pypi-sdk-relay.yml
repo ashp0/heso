@@ -1,0 +1,27 @@
+name: pypi-sdk-relay
+
+# One-shot relay: publish the heso SDK wheels (built + tested in the private
+# heso-enterprise CI) to PyPI using this repo's existing PYPI_API_TOKEN.
+# The wheels ride in on a short-lived branch's dist/ directory; dispatch with
+# that branch as the ref. Remove this workflow once heso-enterprise has its
+# own PyPI Trusted Publisher.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Show wheels
+        run: ls -la dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          attestations: false
