@@ -44,7 +44,7 @@ A 50-second real recording — an LLM agent (Gemini) drives heso to find and com
 
 ```sh
 # Python (uv, pipx, or pip — any of them)
-uv tool install heso          # or: pipx install heso  /  pip install heso
+uv tool install heso-runtime  # or: pipx install heso-runtime  /  pip install heso-runtime
 
 # Node
 npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example.com
