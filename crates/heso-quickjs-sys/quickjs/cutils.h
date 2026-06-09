@@ -1052,36 +1052,49 @@ static inline uint32_t utf8_decode_len(const uint8_t *p, size_t max_len, const u
  */
 static inline int utf8_scan(const char *buf, size_t buf_len, size_t *plen)
 {
-    const uint8_t *p, *p_end, *p_next;
-    size_t i, len;
-    int kind;
-    uint8_t cbits;
+    const uint8_t *p = (const uint8_t *)buf;
+    const uint8_t *p_end = p + buf_len;
+    const uint8_t *p_next;
 
-    kind = UTF8_PLAIN_ASCII;
-    cbits = 0;
-    len = buf_len;
-    // TODO: handle more than 1 byte at a time
-    for (i = 0; i < buf_len; i++)
-        cbits |= buf[i];
-    if (cbits >= 0x80) {
-        p = (const uint8_t *)buf;
-        p_end = p + buf_len;
-        kind = UTF8_NON_ASCII;
-        len = 0;
-        while (p < p_end) {
-            len++;
-            if (*p++ >= 0x80) {
-                /* parse UTF-8 sequence, check for encoding error */
-                uint32_t c = utf8_decode_len(p - 1, p_end - (p - 1), &p_next);
-                if (p_next == p)
-                    kind |= UTF8_HAS_ERRORS;
-                p = p_next;
-                if (c > 0xFF) {
-                    kind |= UTF8_HAS_16BIT;
-                    if (c > 0xFFFF) {
-                        len++;
-                        kind |= UTF8_HAS_NON_BMP1;
-                    }
+    size_t len = 0;
+    int kind = UTF8_PLAIN_ASCII;
+
+    // The buffer is treated as 4 (or 8) bytes instead of 1 byte per item.
+    const size_t *p_size = (const size_t *)p;
+    const size_t buf_len_size = buf_len / sizeof(size_t);
+    const size_t msb_mask = ~(size_t)0 / 255 * 0x80;
+
+    for (size_t i = 0; i < buf_len_size; i++) {
+        // Compare the significant bit: 1....... 1....... 1....... 1.......
+        if ((p_size[i] & msb_mask) != 0) {
+            kind = UTF8_NON_ASCII;
+            break; // Found non-ASCII! Break cleanly to fallback loop.
+        }
+        len += sizeof(size_t); // Safely count the bytes we know are pure ASCII
+    }
+
+    // p will start after the characters we have already scanned and we know are pure ASCII.
+    // Removing unnecessary interations.
+    p = (const uint8_t *)buf + len;
+
+    // This is the slow path
+    while (p < p_end) {
+        len++;
+        if (*p++ >= 0x80) {
+            kind |= UTF8_NON_ASCII;
+
+            /* parse UTF-8 sequence, check for encoding error */
+            uint32_t c = utf8_decode_len(p - 1, p_end - (p - 1), &p_next);
+            if (p_next == p) {
+                kind |= UTF8_HAS_ERRORS;
+            }
+            p = p_next;
+
+            if (c > 0xFF) {
+                kind |= UTF8_HAS_16BIT;
+                if (c > 0xFFFF) {
+                    len++; // surrogate pair takes two units
+                    kind |= UTF8_HAS_NON_BMP1;
                 }
             }
         }
