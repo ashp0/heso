@@ -1,0 +1,47 @@
+# Pinned RFC-3161 TSA root certificates.
+#
+# Each entry pins a root CA whose key terminates a TSA token's certificate
+# chain. `build.rs` (compiled under the `tsa` feature) reads each `file`,
+# asserts it parses as an X.509 certificate, and asserts its DER SHA-256 equals
+# the `sha256_fingerprint` below — FAILING THE BUILD on any drift. The pinned
+# DER is then embedded into the binary via `include_bytes!`.
+#
+# Trust is decided against THESE roots, never against a token's advertised `tsa`
+# string. The embedded signer/intermediate certs in a token are treated as
+# untrusted material that must chain up to one of these.
+#
+# Fingerprints were fetched live (2026-06-08) and cross-checked against a second
+# DigiCert endpoint (the `.crt` DER endpoint matches the `.crt.pem` endpoint
+# byte-for-byte) and, for G4, the published blueprint pin. All three current
+# public TSA roots are RSA (the DigiCert SHA-256 RFC-3161 responder chains
+# leaf -> intermediate -> Trusted Root G4, which is RSA, not ECDSA). ECDSA
+# P-256/P-384 verification is still wired in the verifier for future roots.
+
+[[root]]
+vendor = "digicert"
+subject_cn = "DigiCert Trusted Root G4"
+file = "digicert-trusted-root-g4.der"
+sha256_fingerprint = "552f7bdcf1a7af9e6ce672017f4f12abf77240c78e761ac203d1d9d20ac89988"
+source_url = "https://cacerts.digicert.com/DigiCertTrustedRootG4.crt.pem"
+# RSA (sha384WithRSAEncryption). Self-signed root. The terminal anchor for the
+# current DigiCert SHA-256 timestamping chain. Standard public trust store root.
+
+[[root]]
+vendor = "digicert"
+subject_cn = "DigiCert Assured ID Root CA"
+file = "digicert-assured-id-root.der"
+sha256_fingerprint = "3e9099b5015e8f486c00bcea9d111ee721faba355a89bcf1df69561e3dc6325c"
+source_url = "https://cacerts.digicert.com/DigiCertAssuredIDRootCA.crt.pem"
+# RSA. The historical cross-signing issuer of DigiCert Trusted Root G4. Pinned
+# so the cross-signed G4 path a live token may embed also terminates at a
+# pinned anchor. Standard public trust store root.
+
+[[root]]
+vendor = "freetsa"
+subject_cn = "www.freetsa.org"
+file = "freetsa-cacert.der"
+sha256_fingerprint = "a6379e7cecc05faa3cbf076013d745e327bbbaa38c0b9af22469d4701d18aabc"
+source_url = "https://freetsa.org/files/cacert.pem"
+# RSA (sha512WithRSAEncryption). COMMUNITY-RUN, self-issued root — NOT in
+# standard public trust stores. Kept as a fallback/alt TSA; prefer DigiCert as
+# primary. Trust here comes solely from this pin, by design.

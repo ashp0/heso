@@ -21,9 +21,10 @@ repos:
           a gitignored directory. See AGENTS.md > "Where transient agent reports
           go". The only .md files that ship publicly are README.md, the four
           standard meta files (CONTRIBUTING / SECURITY / CODE_OF_CONDUCT /
-          CHANGELOG), the per-platform npm package READMEs, and spec/HESO-*.md.
+          CHANGELOG), the per-platform npm package READMEs, and the spec/ set
+          (HESO-*.md, ACTION-RECEIPT-*.md, TRANSPARENCY-*.md).
         files: \.md$
-        exclude: ^(README\.md|CONTRIBUTING\.md|SECURITY\.md|CODE_OF_CONDUCT\.md|CHANGELOG\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$
+        exclude: ^(README\.md|CONTRIBUTING\.md|SECURITY\.md|CODE_OF_CONDUCT\.md|CHANGELOG\.md|npm/platforms/[^/]+/README\.md|spec/(HESO|ACTION-RECEIPT|TRANSPARENCY)-[0-9.]+\.md)$
 
       - id: no-rogue-root-md
         name: Refuse new root-level .md other than README + meta files
@@ -37,13 +38,14 @@ repos:
         exclude: ^(README|CONTRIBUTING|SECURITY|CODE_OF_CONDUCT|CHANGELOG)\.md$
 
       - id: spec-and-crates-md-shape
-        name: spec/ holds only HESO-*.md, crates/ ships no .md
+        name: spec/ holds only spec .md files, crates/ ships no .md
         language: fail
         entry: |
-          spec/ may only contain HESO-<version>.md files; crates/<name>/ does
-          not ship any .md surface (the workspace README + the HESO spec are
-          the documentation surfaces). Move design notes and contributor docs
-          to a gitignored directory and link from the spec or top-level README
-          if needed.
+          spec/ may only contain the versioned spec files (HESO-<version>.md,
+          ACTION-RECEIPT-<version>.md, TRANSPARENCY-<version>.md);
+          crates/<name>/ does not ship any .md surface (the workspace README +
+          the specs are the documentation surfaces). Move design notes and
+          contributor docs to a gitignored directory and link from the spec or
+          top-level README if needed.
         files: ^(spec/.*\.md|crates/[^/]+/.*\.md)$
-        exclude: ^spec/HESO-[0-9.]+\.md$
+        exclude: ^spec/(HESO|ACTION-RECEIPT|TRANSPARENCY)-[0-9.]+\.md$

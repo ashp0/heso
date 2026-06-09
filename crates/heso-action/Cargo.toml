@@ -1,0 +1,108 @@
+[package]
+name = "heso-action"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-dependency wire types + OFFLINE VERIFIER for HESO agent ActionReceipts (v1 + v2: chains, quorums, RFC-3161 time anchors, mandates, delegation). Verify-only: this crate carries no signing primitive and no entropy source — signing/minting live in the proprietary HESO compliance SDK, which depends DOWN on this crate, never the reverse. Reuses heso-verify for RFC-8785 canonicalization + BLAKE3 + Ed25519 verify_strict."
+# build.rs pins the RFC-3161 TSA roots at compile time. It does real work only
+# under the `tsa` feature (it parses roots/*.der and asserts SHA-256 vs the
+# manifest, failing the build on drift); under not(tsa) it emits an empty slice.
+build = "build.rs"
+
+[dependencies]
+# heso-verify is the single source of truth for RFC-8785 canonicalization +
+# BLAKE3 + Ed25519 verify_strict. NOTE: verify-only — heso-core (the house
+# SIGNER) is a dev-dependency below, used exclusively to mint test fixtures.
+heso-verify = { path = "../heso-verify" }
+
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+# SHA-256 for the transparency module (RFC 6962 leaf/node hashing) and the TSA
+# feature. Both require sha2 0.11 (the TSA rsa crate pins digest 0.11).
+sha2 = "0.11"
+# NOTE: Ed25519 verification is reused from heso-verify (heso_verify::Signature::
+# verify owns ed25519-dalek), so heso-action takes NO direct dalek dep — it never
+# signs. NO tokio, NO reqwest, NO rng: zero-async, zero-entropy.
+
+# --- RFC-3161 TSA crypto: OPTIONAL, only under the `tsa` feature -------------
+# The DEFAULT build of heso-action stays zero-crypto-extra and byte-stable. The
+# real RFC-3161 CMS/TSTInfo verify path pulls the RustCrypto ASN.1 stack and is
+# compiled ONLY when `tsa` is enabled. With the feature OFF, a present
+# time_anchor still FAILS CLOSED in verify (it is not silently accepted) — see
+# src/tsa.rs. There is NO producer/minting path in this crate: requesting a
+# token from a TSA (the only part that needs a network + a nonce) lives in the
+# proprietary SDK.
+cms = { version = "0.3.0-pre.2", optional = true }
+x509-cert = { version = "0.3.0-rc.4", optional = true }
+der = { version = "0.8", optional = true }
+const-oid = { version = "0.10", features = ["db"], optional = true }
+rsa = { version = "0.10.0-rc.18", optional = true }
+# ECDSA P-256/P-384 verification for TSA signer/cert signatures that are not RSA
+# (so an ECDSA-rooted TSA — e.g. an ECDSA DigiCert responder — verifies).
+# Pinned to the RustCrypto line matching der 0.8 / const-oid 0.10 / signature 3.0.
+ecdsa = { version = "0.17.0-rc.4", optional = true }
+p256 = { version = "0.14.0-pre.10", optional = true, default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14.0-pre.10", optional = true, default-features = false, features = ["ecdsa", "pkcs8"] }
+
+[build-dependencies]
+# build.rs validates the pinned root DER at compile time. These only pull in
+# under the `tsa` feature (CARGO_FEATURE_TSA gates the work in build.rs), but
+# Cargo evaluates [build-dependencies] unconditionally, so they are listed plain.
+x509-cert = { version = "0.3.0-rc.4" }
+sha2 = "0.11"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# OFF by default: the verify path is always real (and fail-closed); only the
+# CMS/TSTInfo cryptographic check is gated.
+default = []
+# `tsa` = the OFFLINE verify + token-decode crypto stack. Pins the in-binary TSA
+# roots (build.rs) and links NO http client and NO entropy source.
+tsa = ["dep:cms", "dep:x509-cert", "dep:der", "dep:const-oid", "dep:rsa", "dep:ecdsa", "dep:p256", "dep:p384"]
+
+[dev-dependencies]
+# The house Ed25519 signer — TEST-ONLY, used to mint the golden fixtures the
+# verify path is asserted against. Keys are fixed seeds (no OsRng anywhere);
+# Ed25519 is deterministic, so the pinned golden vectors are byte-stable.
+heso-core = { path = "../heso-core" }
+# TSA crypto tests mint a throwaway RSA root + TSA signer cert + a real RFC-3161
+# token at TEST time (no fixture bytes are checked in), then verify the full path
+# against the generated root. The cert + CMS BUILDERS assemble those structures;
+# the rest of the ASN.1 stack mirrors the versions the `tsa` feature pins. These
+# dev-deps only matter when a test build also turns on `tsa`; the default
+# `cargo test` build never touches them (the tests are `#[cfg(all(test,
+# feature = "tsa"))]`).
+x509-cert = { version = "0.3.0-rc.4", features = ["builder"] }
+# NOTE: cms's `builder` feature is intentionally NOT enabled — its EnvelopedData /
+# KARI builder code does not compile against the transitively-resolved
+# cipher/elliptic-curve versions. The test assembles the SignedData / SignerInfo
+# by hand from the plain cms types (signing the signed-attrs DER with RSA
+# directly), which is all an RFC-3161 token needs.
+cms = { version = "0.3.0-pre.2" }
+der = { version = "0.8", features = ["alloc", "oid"] }
+const-oid = { version = "0.10", features = ["db"] }
+rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
+sha2 = "0.11"
+# The cert/CMS builders take an RNG (RSA blinding); the test seeds a deterministic
+# BLAKE3-XOF CryptoRng so no OS entropy or network is touched.
+rand_core = "0.10"
+signature = "3.0.0-rc.4"
+# The ECDSA TSA test fixtures mint a throwaway P-256 hierarchy + an
+# `ecdsa-with-SHA256` token, so the verifier's ECDSA path is proven against a
+# REAL P-256 signature (not just that it compiles). These need `alloc` (DER
+# signature + SPKI encoding), which the lib's verify-only p256/p384 deps do not
+# turn on. They are DEV-only: they never widen the `cargo build --features tsa`
+# dependency surface (dev-deps are excluded from a non-test build/`cargo tree`).
+p256 = { version = "0.14.0-pre.10", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+p384 = { version = "0.14.0-pre.10", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
